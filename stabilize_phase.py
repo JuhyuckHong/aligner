@@ -47,7 +47,7 @@ from tqdm import tqdm
 
 
 # === Configuration ===
-ROTATION_THRESHOLD_DEG = 0.1  # Apply rotation correction if > this value
+ROTATION_THRESHOLD_DEG = 0.02  # Apply rotation correction if > this value (Lowered from 0.1)
 DAMPING_DEADZONE = 3.0        # px, no damping within this range
 DAMPING_FACTOR = 0.99         # Pull back 1% per frame when outside deadzone
 DAY_REFINE_SAMPLES = 30       # Samples per day for day-level refinement
@@ -289,10 +289,26 @@ def stabilize_folder_chained(input_dir, output_dir, ext, img_shape, scale=0.5,
                 angle = 0
                 warp_matrix = None
             elif abs(angle) > ROTATION_THRESHOLD_DEG and ecc_success:
-                # Use ECC results for rotation correction
+                # Use ECC for Rotation + Gradient PC for Translation (Hybrid Best)
                 status = "ROT_CORR"
-                dx_frame = ecc_dx
-                dy_frame = ecc_dy
+                
+                # 1. Derotate Current Gradient Map to match Previous orientation
+                # ECC 'angle' is what's needed to align Curr to Prev.
+                center_small = (curr_edge_small.shape[1] // 2, curr_edge_small.shape[0] // 2)
+                M_derot = cv2.getRotationMatrix2D(center_small, angle, 1.0)
+                
+                curr_edge_derot = cv2.warpAffine(curr_edge_small, M_derot, 
+                                               (curr_edge_small.shape[1], curr_edge_small.shape[0]),
+                                               flags=cv2.INTER_LINEAR)
+                                               
+                # 2. Re-run Phase Correlation on Derotated image
+                # This gives pure translation without rotation error
+                pc_dx, pc_dy, pc_resp = phase_correlation(prev_edge_small, curr_edge_derot)
+                
+                dx_frame = pc_dx / scale
+                dy_frame = pc_dy / scale
+                
+                # angle is kept from ECC
                 rotation_count += 1
             else:
                 warp_matrix = None  # No rotation needed
@@ -315,10 +331,14 @@ def stabilize_folder_chained(input_dir, output_dir, ext, img_shape, scale=0.5,
         
         # Apply transformation
         if warp_matrix is not None and abs(angle) > ROTATION_THRESHOLD_DEG:
-            # Apply Euclidean (rotation + translation)
-            warp_matrix[0, 2] = acc_dx
-            warp_matrix[1, 2] = acc_dy
-            aligned = cv2.warpAffine(curr_img, warp_matrix, (w, h), 
+            # Apply Euclidean (rotation + translation) with Center Rotation
+            # ECC returns translation relative to top-left, which can shift image wildly if rotated
+            # So we reconstruct the matrix using getRotationMatrix2D (center rotation)
+            center = (w // 2, h // 2)
+            M_rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+            M_rot[0, 2] += acc_dx
+            M_rot[1, 2] += acc_dy
+            aligned = cv2.warpAffine(curr_img, M_rot, (w, h), 
                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         else:
             # Translation only
@@ -342,14 +362,30 @@ def refine_day_alignment(base_dir, folders):
     """
     print("\n=== Day-Level Refinement ===")
     
-    def get_day_samples(folder_path, n_samples=DAY_REFINE_SAMPLES):
+    def get_day_samples(folder_path, n_samples=3):
         images = sorted(glob(os.path.join(folder_path, "*.jpg")))
         if not images:
             return []
-        mid_range = images[len(images)//4 : 3*len(images)//4]
-        if len(mid_range) < n_samples:
-            return mid_range
-        return random.sample(mid_range, n_samples)
+            
+        # Sort by distance to 12:00:00
+        timed_images = []
+        for img in images:
+            try:
+                basename = os.path.basename(img)
+                time_part = basename.split('_')[1].split('.')[0] # HH-MM-SS
+                h, m, s = map(int, time_part.split('-'))
+                minutes = h * 60 + m
+                diff = abs(minutes - 720) # 720 min = 12:00
+                timed_images.append((diff, img))
+            except:
+                continue
+        
+        # Sort by time difference
+        timed_images.sort(key=lambda x: x[0])
+        
+        # Take top N samples
+        selected = [x[1] for x in timed_images[:n_samples]]
+        return selected if selected else (images[:n_samples] if images else [])
     
     def calculate_day_offset(folder1, folder2):
         samples1 = get_day_samples(folder1)
@@ -398,21 +434,61 @@ def refine_day_alignment(base_dir, folders):
         print(f"  {folders[i-1]} -> {folders[i]}: dx={dx:.1f}, dy={dy:.1f} (cumul: {cumulative_dx:.1f}, {cumulative_dy:.1f})")
     
     # Apply offsets
-    print("\n  Applying day-level corrections...")
-    for folder in folders:
+    print("\n  Applying day-level corrections (Early Correction Strategy)...")
+    
+    prev_cum_dx, prev_cum_dy = 0.0, 0.0
+    
+    for i, folder in enumerate(folders):
         folder_path = os.path.join(base_dir, folder)
-        offset_dx, offset_dy = day_offsets[folder]
+        target_cum_dx, target_cum_dy = day_offsets[folder]
         
-        if abs(offset_dx) < 0.5 and abs(offset_dy) < 0.5:
-            continue  # Skip if negligible
+        # Gap to bridge (from prev_end to target_end)
+        gap_dx = target_cum_dx - prev_cum_dx
+        gap_dy = target_cum_dy - prev_cum_dy
         
         images = sorted(glob(os.path.join(folder_path, "*.jpg")))
-        for img_path in tqdm(images, desc=f"    {folder}", leave=False):
+        n_frames = len(images)
+        if n_frames == 0: continue
+            
+        # Determine Transition Period (Early 20%)
+        # Goal: Transition from 0 to Gap as early as possible (during morning)
+        # so that the main day content is firmly locked to the target position.
+        trans_len = int(n_frames * 0.2)
+        
+        # Sub-pixel constraint check (max 0.5px per frame)
+        max_gap = max(abs(gap_dx), abs(gap_dy))
+        min_steps = int(max_gap / 0.5)
+        
+        # If gap is huge, extend transition time
+        if min_steps > trans_len:
+            trans_len = min(min_steps, n_frames)
+            
+        for idx, img_path in enumerate(tqdm(images, desc=f"    {folder}", leave=False)):
+            # Calculate interpolation factor (0.0 -> 1.0)
+            if idx < trans_len:
+                # Transitioning
+                alpha = idx / trans_len if trans_len > 0 else 1.0
+            else:
+                # Fully corrected (Day locked)
+                alpha = 1.0
+            
+            # Current Shift = Start + alpha * Gap
+            curr_dx = prev_cum_dx + alpha * gap_dx
+            curr_dy = prev_cum_dy + alpha * gap_dy
+            
+            # Skip if negligible
+            if abs(curr_dx) < 0.1 and abs(curr_dy) < 0.1:
+                continue
+                
             img = cv2.imread(img_path)
             h, w = img.shape[:2]
-            M = np.float32([[1, 0, offset_dx], [0, 1, offset_dy]])
+            M = np.float32([[1, 0, curr_dx], [0, 1, curr_dy]])
             corrected = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             cv2.imwrite(img_path, corrected, [cv2.IMWRITE_JPEG_QUALITY, 98])
+            
+        # Update start point for next day
+        prev_cum_dx = target_cum_dx
+        prev_cum_dy = target_cum_dy
 
 def process_all_folders(base_input, base_output, ext='jpg', refine=True):
     """Process all subfolders with chained alignment + rotation correction + day refinement"""
@@ -521,6 +597,7 @@ if __name__ == "__main__":
     parser.add_argument("--crf", type=int, default=18, help="Video quality (0-51)")
     parser.add_argument("--batch", type=int, default=500, help="Batch size for video")
     parser.add_argument("--no-refine", action="store_true", help="Skip day-level refinement")
+    parser.add_argument("--refine-only", action="store_true", help="Run ONLY day-level refinement on existing output")
     
     args = parser.parse_args()
     
@@ -528,7 +605,17 @@ if __name__ == "__main__":
     print(f"Output: {args.output}")
     print()
     
-    process_all_folders(args.input, args.output, args.ext, refine=not args.no_refine)
+    if args.refine_only:
+        print("Mode: Refine Only (Late Correction)")
+        subfolders = [d for d in os.listdir(args.output) 
+                      if os.path.isdir(os.path.join(args.output, d)) and d != 'logs']
+        subfolders = sorted(subfolders)
+        if len(subfolders) > 1:
+            refine_day_alignment(args.output, subfolders)
+        else:
+            print("Not enough folders to refine.")
+    else:
+        process_all_folders(args.input, args.output, args.ext, refine=not args.no_refine)
     
     if args.video:
         print(f"\n{'='*50}")

@@ -36,10 +36,10 @@ import shutil
 
 def get_images(input_dir, ext='jpg'):
     """Get sorted list of images"""
-    patterns = [f"*.{ext}", f"*.{ext.upper()}"]
+    patterns = [f"**/*.{ext}", f"**/*.{ext.upper()}"]
     images = []
     for pattern in patterns:
-        images.extend(glob(os.path.join(input_dir, pattern)))
+        images.extend(glob(os.path.join(input_dir, pattern), recursive=True))
     return sorted(images)
 
 def create_chunk_video(image_list, output_file, fps=30, crf=18):

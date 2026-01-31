@@ -39,22 +39,53 @@ pip install -r requirements.txt
 ## 🛠️ 도구 설명
 
 ### 1. `stabilize_phase.py` - 자동 흔들림 보정 (메인)
-
+ 
 Phase Correlation + ECC 알고리즘을 사용하여 이미지 시퀀스의 흔들림과 회전을 자동으로 보정합니다.
 
-**알고리즘 (3단계 파이프라인):**
+**🚀 Alignment Pipeline Flow:**
 
-1. **Chained Neighbor Alignment**: 이웃 프레임 간 이동량 계산 및 누적
-2. **Rotation Correction**: 회전이 감지되면 ECC로 보정 (threshold: 0.1°)
-3. **Day-level Refinement**: 날짜 간 랜덤 샘플링으로 드리프트 보정
+```mermaid
+graph TD
+    A[Input Images] --> B{Intra-day Alignment}
+    B -->|Phase Correlation| C[Gradient Magnitude Check]
+    C -->|Translation| D[ECC Rotation Check]
+    D -->|If Rot > 0.02°| E[Derotate & Re-run PC]
+    D -->|If Rot <= 0.02°| F[PC Translation Only]
+    E --> G[Stabilized Folder]
+    F --> G
+    
+    G --> H{Day Transition}
+    H -->|Night-to-Night| I[Gradient Phase Correlation]
+    I --> J[Chained Connection]
+    
+    J --> K{Day Refinement}
+    K -->|Day-to-Day Gap| L[Early Correction Strategy]
+    L --> M[Final Stabilized Output]
+```
+
+**알고리즘 상세 (Advanced Logic):**
+
+1. **Hybrid Alignment (ECC + Gradient PC)**
+   - **회전(Rotation)**: ECC 알고리즘을 사용하여 0.02° 이상의 미세한 회전까지 정밀하게 감지합니다.
+   - **이동(Translation)**: 회전이 감지되면 이미지를 역회전(Derotate)시킨 후, **Gradient Phase Correlation**을 다시 수행하여 순수한 이동량을 계산합니다. 이로써 회전으로 인한 이동량 왜곡을 원천 차단합니다.
+
+2. **Gradient Phase Correlation**
+   - 단순 Edge나 Pixel Intensity 대신 **Gradient Magnitude**를 사용하여 조명 변화에 강인합니다. 
+
+3. **Center Rotation Correction**
+   - 이미지 **중심(Center)**을 기준으로 회전하여 보정합니다.
+
+4. **Early Day Refinement (Morning Correction)**
+   - 아침 시간대(앞 20% 구간)에 빠르게 위치를 바로잡아, **밝은 낮 시간에는 완벽하게 고정된 화면**을 제공합니다.
+   - Sub-pixel(0.5px) 제약 조건을 준수하여 보정이 눈에 띄지 않도록 부드럽게 처리합니다.
 
 **핵심 기능:**
 | 기능 | 설명 |
 |------|------|
-| Chained Alignment | 이웃 프레임 간 정렬로 부드러운 결과 |
-| Rotation Correction | 0.1° 이상 회전 시 ECC로 자동 보정 |
-| Deadzone Damping | ±3px 내에서는 자유, 초과 시 0.99 계수로 원점 복귀 |
-| Day Refinement | 날짜 간 30개 랜덤 샘플 비교로 드리프트 제거 |
+| **Gradient PC** | 조명 변화에 강한 정합 (Edge보다 강력) |
+| **Center Rotation** | 중심축 기준 정밀 회전 보정 |
+| **Early Refine** | 아침에 빠르게 자리 잡아 낮 시간 고정 |
+| **Deadzone** | ±3px 미세 흔들림 무시 (Damping) |
 
 **사용법:**
 ```bash
@@ -72,6 +103,9 @@ python stabilize_phase.py --video --fps 30 --crf 18
 
 # Day Refinement 건너뛰기
 python stabilize_phase.py --no-refine
+
+# 이미 보정된 폴더에 Day Refinement만 다시 적용
+python stabilize_phase.py --refine-only
 ```
 
 **옵션:**
@@ -112,22 +146,37 @@ input/                    output/
 **설정값:**
 | 항목 | 값 | 설명 |
 |------|-----|------|
-| Rotation Threshold | 0.1° | 이 이상 회전 시 ECC 보정 |
+| Rotation Threshold | 0.02° | 이 이상 회전 시 ECC 보정 |
 | Damping Deadzone | 3px | 이 범위 내에서는 Damping 미적용 |
 | Damping Factor | 0.99 | 프레임당 1% 원점 복귀 |
 | Day Refine Samples | 30 | 날짜당 랜덤 샘플 수 |
 
 ---
 
-### 2. `refine_day_alignment.py` - 날짜별 보정 후처리
+### 2. `stabilize_parallel.py` - 고속 병렬 처리 (권장)
 
-이미 보정된 이미지에 날짜별 오프셋 보정을 추가로 적용합니다.
-(`stabilize_phase.py`에 통합되어 있지만, 단독 실행도 가능)
+`stabilize_phase.py`와 동일한 정밀 알고리즘(Hybrid Alignment, Early Refine)을 사용하지만, **멀티코어 병렬 처리**를 통해 속도를 획기적으로 향상시킨 버전입니다.
+
+**특징:**
+- **🚀 압도적인 속도**: CPU 코어를 모두 활용하여 분석(Analysis)과 렌더링(Rendering)을 병렬로 수행합니다. (기존 대비 5~10배 빠름)
+- **Log-First**: 이미지 저장 전에 로그 파일(`full_log.txt`)을 먼저 생성하여 빠른 결과 검증이 가능합니다.
+- **Two-Pass 구조**: 분석 단계에서 이미지를 저장하지 않아 I/O 병목을 최소화했습니다.
 
 **사용법:**
 ```bash
-python refine_day_alignment.py
+# 기본 실행 (자동으로 가용 CPU 코어 사용)
+python stabilize_parallel.py --video
+
+# 워커 프로세스 수 수동 지정 (예: 8개)
+python stabilize_parallel.py --video --workers 8
+
+# 결과물은 'output_parallel' 폴더에 저장됩니다.
 ```
+
+**언제 사용하나요?**
+- 이미지가 수천 장 이상일 때
+- 빠른 처리가 필요할 때
+- 로직 테스트보다 결과물 생산이 목적일 때
 
 ---
 
