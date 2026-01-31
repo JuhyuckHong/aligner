@@ -5,3 +5,8 @@
 /output_phase.mp4
 /ffmpeg_list.txt
 /temp
+
+# PyInstaller
+/build
+/dist
+*.spec

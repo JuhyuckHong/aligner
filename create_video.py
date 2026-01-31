@@ -9,20 +9,15 @@ Memory-safe 배치 처리로 대량의 이미지도 메모리 부족 없이 영�
   # 기본 (30fps, CRF 18)
   python create_video.py -i output -o timelapse.mp4
   
-  # 웹 업로드용 (가벼운 영상)
-  python create_video.py -i output -o timelapse.mp4 --fps 30 --crf 23
-  
-  # 고품질
-  python create_video.py -i output -o timelapse.mp4 --fps 60 --crf 12
-  
-  # 메모리 부족 시 배치 줄이기
-  python create_video.py -i output -o timelapse.mp4 --batch 100
+  # 해상도 변경 (1080p)
+  python create_video.py -i output -o timelapse.mp4 --width 1920
 
 옵션:
   -i, --input   : 입력 이미지 폴더 (필수)
   -o, --output  : 출력 영상 파일 (기본: output.mp4)
   --fps         : 초당 프레임 수 (기본: 30)
   --crf         : 품질 0-51, 낮을수록 고품질 (기본: 18)
+  --width       : 영상 가로 해상도 (세로는 비율 유지)
   --batch       : 배치당 이미지 수 (기본: 200)
   --ext         : 이미지 확장자 (기본: jpg)
 =============================================================================
@@ -35,14 +30,14 @@ import tempfile
 import shutil
 
 def get_images(input_dir, ext='jpg'):
-    """Get sorted list of images"""
+    """Get sorted list of images (recursive)"""
     patterns = [f"**/*.{ext}", f"**/*.{ext.upper()}"]
     images = []
     for pattern in patterns:
         images.extend(glob(os.path.join(input_dir, pattern), recursive=True))
     return sorted(images)
 
-def create_chunk_video(image_list, output_file, fps=30, crf=18):
+def create_chunk_video(image_list, output_file, fps=30, crf=18, width=None):
     """Create a video from a list of images using concat demuxer"""
     # Create temporary list file
     list_file = output_file + ".txt"
@@ -62,14 +57,20 @@ def create_chunk_video(image_list, output_file, fps=30, crf=18):
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-crf", str(crf),
-        "-preset", "medium",  # faster than slow, uses less memory
+        "-preset", "medium",
         "-r", str(fps),
-        "-movflags", "+faststart",
-        output_file
+        "-movflags", "+faststart"
     ]
     
+    if width:
+        cmd.extend(["-vf", f"scale={width}:-2"])
+        
+    cmd.append(output_file)
+    
     result = subprocess.run(cmd, capture_output=True, text=True)
-    os.remove(list_file)
+    try:
+        os.remove(list_file)
+    except: pass
     
     if result.returncode != 0:
         print(f"Error creating {output_file}: {result.stderr}")
@@ -95,14 +96,16 @@ def concat_videos(video_list, output_file):
     ]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
-    os.remove(list_file)
+    try:
+        os.remove(list_file)
+    except: pass
     
     if result.returncode != 0:
         print(f"Error concatenating videos: {result.stderr}")
         return False
     return True
 
-def create_video_chunked(input_dir, output_file, fps=30, crf=18, batch_size=200, ext='jpg'):
+def create_video_chunked(input_dir, output_file, fps=30, crf=18, batch_size=200, ext='jpg', width=None):
     """Create video by processing images in chunks to avoid memory issues"""
     images = get_images(input_dir, ext)
     if not images:
@@ -126,7 +129,7 @@ def create_video_chunked(input_dir, output_file, fps=30, crf=18, batch_size=200,
             chunk_file = os.path.join(temp_dir, f"chunk_{chunk_num:04d}.mp4")
             print(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk_images)} images)...")
             
-            if create_chunk_video(chunk_images, chunk_file, fps, crf):
+            if create_chunk_video(chunk_images, chunk_file, fps, crf, width):
                 chunk_videos.append(chunk_file)
             else:
                 print(f"Failed to create chunk {chunk_num}")
@@ -156,6 +159,7 @@ def main():
     parser.add_argument("--crf", type=int, default=18, help="Quality (0-51, lower=better, default: 18)")
     parser.add_argument("--batch", type=int, default=200, help="Images per batch (default: 200)")
     parser.add_argument("--ext", default="jpg", help="Image extension (default: jpg)")
+    parser.add_argument("--width", type=int, help="Target video width (e.g. 1920)")
     
     args = parser.parse_args()
     
@@ -165,7 +169,8 @@ def main():
         fps=args.fps,
         crf=args.crf,
         batch_size=args.batch,
-        ext=args.ext
+        ext=args.ext,
+        width=args.width
     )
 
 if __name__ == "__main__":
