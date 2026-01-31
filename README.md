@@ -8,12 +8,17 @@
 
 ```
 aligner/
-├── stabilize_phase.py     # 자동 흔들림 보정 (Phase Correlation)
-├── create_video.py        # 메모리 효율적인 영상 생성
-├── requirements.txt       # Python 의존성
-├── util/
-│   └── manual_align_gui.py  # 수동 정렬 GUI 도구
-└── README.md
+├── stabilize_phase.py       # 메인: 자동 흔들림 + 회전 보정
+├── create_video.py          # 영상 생성 (배치 처리)
+├── requirements.txt         # Python 의존성
+├── README.md
+└── util/                    # 유틸리티 및 개발용 스크립트
+    ├── manual_align_gui.py  # 수동 정렬 GUI
+    ├── review_outliers.py   # 아웃라이어 검토
+    ├── refine_day_alignment.py  # 날짜별 보정 (단독 실행용)
+    ├── stabilize_neighbor.py    # (개발용) 이웃 정렬 테스트
+    ├── check_alignment.py       # (개발용) 정합 검증
+    └── test_outlier_align.py    # (개발용) 아웃라이어 테스트
 ```
 
 ---
@@ -33,19 +38,27 @@ pip install -r requirements.txt
 
 ## 🛠️ 도구 설명
 
-### 1. `stabilize_phase.py` - 자동 흔들림 보정
+### 1. `stabilize_phase.py` - 자동 흔들림 보정 (메인)
 
-Phase Correlation 알고리즘을 사용하여 이미지 시퀀스의 흔들림을 자동으로 보정합니다.
+Phase Correlation + ECC 알고리즘을 사용하여 이미지 시퀀스의 흔들림과 회전을 자동으로 보정합니다.
 
-**알고리즘:**
-- Canny Edge Detection으로 엣지 이미지 생성
-- Phase Correlation으로 프레임 간 이동량 계산
-- 중간 프레임을 기준으로 정렬 (조명 변화에 강건)
-- 이상치(outlier) 자동 필터링
+**알고리즘 (3단계 파이프라인):**
+
+1. **Chained Neighbor Alignment**: 이웃 프레임 간 이동량 계산 및 누적
+2. **Rotation Correction**: 회전이 감지되면 ECC로 보정 (threshold: 0.1°)
+3. **Day-level Refinement**: 날짜 간 랜덤 샘플링으로 드리프트 보정
+
+**핵심 기능:**
+| 기능 | 설명 |
+|------|------|
+| Chained Alignment | 이웃 프레임 간 정렬로 부드러운 결과 |
+| Rotation Correction | 0.1° 이상 회전 시 ECC로 자동 보정 |
+| Deadzone Damping | ±3px 내에서는 자유, 초과 시 0.99 계수로 원점 복귀 |
+| Day Refinement | 날짜 간 30개 랜덤 샘플 비교로 드리프트 제거 |
 
 **사용법:**
 ```bash
-# 기본 실행 (input → output)
+# 기본 실행 (input → output, Day Refinement 포함)
 python stabilize_phase.py
 
 # 커스텀 폴더 지정
@@ -54,8 +67,11 @@ python stabilize_phase.py -i my_input -o my_output
 # 보정 + 영상 생성까지
 python stabilize_phase.py --video
 
-# 영상 60fps로
-python stabilize_phase.py --video --fps 60
+# 고품질 영상
+python stabilize_phase.py --video --fps 30 --crf 18
+
+# Day Refinement 건너뛰기
+python stabilize_phase.py --no-refine
 ```
 
 **옵션:**
@@ -64,31 +80,58 @@ python stabilize_phase.py --video --fps 60
 | `-i`, `--input` | 입력 폴더 | `input` |
 | `-o`, `--output` | 출력 폴더 | `output` |
 | `--ext` | 이미지 확장자 | `jpg` |
-| `-v`, `--video` | 각 폴더별 MP4 생성 | 꺼짐 |
+| `-v`, `--video` | 통합 MP4 생성 | 꺼짐 |
 | `--fps` | 영상 FPS | `30` |
+| `--crf` | 영상 품질 (0-51, 낮을수록 고품질) | `18` |
+| `--batch` | 영상 배치당 이미지 수 | `500` |
+| `--no-refine` | Day-level Refinement 건너뛰기 | 꺼짐 |
 
 **하위 폴더 자동 처리:**
 
-날짜별로 폴더가 분리된 경우 자동으로 감지하여 각각 처리합니다.
+날짜별로 폴더가 분리된 경우, 자동으로 체인 연결하여 처리합니다.
 
 ```
 input/                    output/
-├── 2026-01-19/    →     ├── 2026-01-19/
-├── 2026-01-20/    →     ├── 2026-01-20/
-└── 2026-01-21/    →     └── 2026-01-21/
+├── 2026-01-01/    →     ├── 2026-01-01/
+├── 2026-01-02/    →     ├── 2026-01-02/
+└── 2026-01-03/    →     ├── 2026-01-03/
+                         ├── logs/
+                         │   ├── [timestamp]_full.txt
+                         │   └── [timestamp]_outliers.txt
+                         └── combined_all.mp4
 ```
 
-**특징:**
-| 항목 | 설명 |
+**출력 파일:**
+| 파일 | 설명 |
 |------|------|
-| 보정 유형 | 평행이동 (Translation) |
-| 기준 프레임 | 중간 프레임 (n // 2) |
-| 최대 이동량 | 100px (초과 시 이전 값 사용) |
-| 출력 품질 | JPEG Quality 98 |
+| `output/[폴더]/[이미지].jpg` | 보정된 이미지 |
+| `output/logs/[timestamp]_full.txt` | 전체 보정 로그 |
+| `output/logs/[timestamp]_outliers.txt` | 아웃라이어 목록 |
+| `output/combined_all.mp4` | 통합 영상 (--video 옵션) |
+
+**설정값:**
+| 항목 | 값 | 설명 |
+|------|-----|------|
+| Rotation Threshold | 0.1° | 이 이상 회전 시 ECC 보정 |
+| Damping Deadzone | 3px | 이 범위 내에서는 Damping 미적용 |
+| Damping Factor | 0.99 | 프레임당 1% 원점 복귀 |
+| Day Refine Samples | 30 | 날짜당 랜덤 샘플 수 |
 
 ---
 
-### 2. `create_video.py` - 메모리 효율적 영상 생성
+### 2. `refine_day_alignment.py` - 날짜별 보정 후처리
+
+이미 보정된 이미지에 날짜별 오프셋 보정을 추가로 적용합니다.
+(`stabilize_phase.py`에 통합되어 있지만, 단독 실행도 가능)
+
+**사용법:**
+```bash
+python refine_day_alignment.py
+```
+
+---
+
+### 3. `create_video.py` - 메모리 효율적 영상 생성
 
 대량의 이미지를 배치로 나눠 처리하여 메모리 부족 문제를 해결합니다.
 
@@ -113,21 +156,9 @@ python create_video.py --input INPUT_FOLDER --output OUTPUT.mp4 [OPTIONS]
 | `--batch` | 배치당 이미지 수 | `200` |
 | `--ext` | 이미지 확장자 | `jpg` |
 
-**예시:**
-```bash
-# 기본 설정
-python create_video.py -i output -o timelapse.mp4
-
-# 고품질 + 60fps
-python create_video.py -i output -o timelapse_hq.mp4 --fps 60 --crf 12
-
-# 메모리 부족 시 배치 크기 줄이기
-python create_video.py -i output -o timelapse.mp4 --batch 100
-```
-
 ---
 
-### 3. `util/manual_align_gui.py` - 수동 정렬 GUI
+### 4. `util/manual_align_gui.py` - 수동 정렬 GUI
 
 두 이미지를 비교하며 수동으로 정렬 오프셋을 조정하는 GUI 도구입니다.
 
@@ -141,6 +172,8 @@ python create_video.py -i output -o timelapse.mp4 --batch 100
 |---|---|
 | `W` / `A` / `S` / `D` | 1px 이동 (상/좌/하/우) |
 | `I` / `J` / `K` / `L` | 10px 이동 (상/좌/하/우) |
+| `Arrow Keys` | 0.1px 이동 |
+| `Shift + Arrow` | 0.01px 이동 |
 | `SPACE` | Reference ↔ Aligned 토글 |
 | `Z` | Overlay 모드 (반투명 겹침) |
 | `마우스 이동` | 확대 위치 지정 |
@@ -153,32 +186,77 @@ python util/manual_align_gui.py --ref reference.jpg --mov moving.jpg
 
 # 폴더의 처음 두 이미지 사용
 python util/manual_align_gui.py --input-dir input
+```
 
-# 기본값 (input 폴더)
-python util/manual_align_gui.py
+---
+
+### 5. `util/review_outliers.py` - 아웃라이어 검토 및 GT 수집
+
+로그에 기록된 스킵된 프레임들을 수동으로 검토하고, Ground Truth를 수집합니다.
+
+**사용법:**
+```bash
+python util/review_outliers.py --log output/logs/[timestamp]_outliers.txt
 ```
 
 ---
 
 ## 📋 일반적인 워크플로우
 
-### 1. 흔들림 보정 → 영상 생성 (자동)
+### 1. 완전 자동 (권장)
 
 ```bash
-# Step 1: 이미지 폴더를 input_dir에 복사
+# Step 1: 이미지 폴더를 input에 복사
+# input/2026-01-01/, input/2026-01-02/, ...
 
-# Step 2: 자동 보정 실행
-python stabilize_phase.py
-
-# Step 3: 영상 생성
-python create_video.py -i output -o timelapse.mp4
+# Step 2: 자동 보정 + 영상 생성
+python stabilize_phase.py --video --fps 30 --crf 23
 ```
 
-### 2. 수동 정렬 확인
+### 2. 단계별 실행
 
 ```bash
-# 보정 결과 확인
-python util/manual_align_gui.py --ref original/img1.jpg --mov stabilized/img1.jpg
+# Step 1: 보정만 실행
+python stabilize_phase.py
+
+# Step 2: 결과 확인 (GUI)
+python util/manual_align_gui.py --ref output/2026-01-01/img1.jpg --mov output/2026-01-01/img2.jpg
+
+# Step 3: 영상 생성
+python create_video.py -i output -o timelapse.mp4 --fps 30
+```
+
+### 3. 아웃라이어 검토
+
+```bash
+# outliers.txt 확인 후 수동 검토
+python util/review_outliers.py --log output/logs/[timestamp]_outliers.txt
+```
+
+---
+
+## 📄 로그 파일 형식
+
+### `output/logs/[timestamp]_full.txt`
+```
+# Stabilization Log
+# Execution: 2026-01-30_10-45
+# Date Range: 2026-01-01 to 2026-01-28
+# Method: Chained Neighbor + Rotation Correction + Day Refinement
+# Rotation Threshold: 0.1°
+# Damping: Deadzone=3.0px, Factor=0.99
+
+2026-01-01	2026-01-01_06-00-00.jpg	dx=0.0	dy=0.0	resp=1.000	status=FIRST
+2026-01-01	2026-01-01_06-06-00.jpg	dx=0.2	dy=0.1	resp=0.845	status=OK
+2026-01-28	2026-01-28_14-00-00.jpg	dx=-5.2	dy=3.1	resp=0.712	status=ROT(0.18°)
+```
+
+### `output/logs/[timestamp]_outliers.txt`
+```
+# Outlier Report
+# Total outliers: 2
+
+2026-01-15	2026-01-15_06-12-00.jpg	dx=152.3, dy=87.2, resp=0.021
 ```
 
 ---
@@ -190,7 +268,7 @@ python util/manual_align_gui.py --ref original/img1.jpg --mov stabilized/img1.jp
 | 0 | 무손실 | 아카이브 |
 | 12-14 | 매우 고품질 | 전문가용 |
 | **18** | 고품질 (기본값) | 일반 사용 |
-| 23 | 중간 품질 | 웹 업로드 |
+| **23** | 중간 품질 | 웹 업로드 (권장) |
 | 28+ | 저품질 | 미리보기 |
 
 ---
@@ -199,18 +277,20 @@ python util/manual_align_gui.py --ref original/img1.jpg --mov stabilized/img1.jp
 
 ### FFmpeg 메모리 부족
 ```bash
-# 배치 크기 줄이기
-python create_video.py -i INPUT -o OUTPUT.mp4 --batch 100
+python stabilize_phase.py --video --batch 100
 ```
 
-### 보정이 잘 안 될 때
-- 첫 번째 프레임이 흐리거나 이상한 경우 문제 발생 가능
-- `stabilize_phase.py`는 중간 프레임을 기준으로 사용
-- 극심한 흔들림은 수동 정렬 권장
+### 영상 재생 끊김
+- 해상도가 너무 큼 (4K 이상) → 자동으로 1080p로 다운스케일됨
+- CRF 낮추기: `--crf 23`
 
-### 이미지 파일명 형식
-- 권장: `YYYY-MM-DD_HH-MM-SS.jpg`
-- 정렬 순서: 파일명 알파벳순 (sorted)
+### 특정 날짜만 흔들림이 심함
+- 회전 보정 로그 확인: `status=ROT(0.18°)`
+- 해당 날짜 원본 이미지 확인 (바람, 진동 등)
+
+### 날짜 간 점프 발생
+- Day Refinement가 적용되었는지 확인
+- `--no-refine` 옵션이 있으면 제거
 
 ---
 

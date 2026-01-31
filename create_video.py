@@ -1,3 +1,32 @@
+"""
+=============================================================================
+create_video.py - 이미지 시퀀스를 영상으로 변환
+=============================================================================
+
+Memory-safe 배치 처리로 대량의 이미지도 메모리 부족 없이 영상 생성.
+
+사용법:
+  # 기본 (30fps, CRF 18)
+  python create_video.py -i output -o timelapse.mp4
+  
+  # 웹 업로드용 (가벼운 영상)
+  python create_video.py -i output -o timelapse.mp4 --fps 30 --crf 23
+  
+  # 고품질
+  python create_video.py -i output -o timelapse.mp4 --fps 60 --crf 12
+  
+  # 메모리 부족 시 배치 줄이기
+  python create_video.py -i output -o timelapse.mp4 --batch 100
+
+옵션:
+  -i, --input   : 입력 이미지 폴더 (필수)
+  -o, --output  : 출력 영상 파일 (기본: output.mp4)
+  --fps         : 초당 프레임 수 (기본: 30)
+  --crf         : 품질 0-51, 낮을수록 고품질 (기본: 18)
+  --batch       : 배치당 이미지 수 (기본: 200)
+  --ext         : 이미지 확장자 (기본: jpg)
+=============================================================================
+"""
 import os
 import subprocess
 import argparse
