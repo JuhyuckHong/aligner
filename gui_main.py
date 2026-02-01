@@ -1,5 +1,5 @@
 """
-gui_main.py - Main GUI for Aligner Pro
+gui_main.py - Main GUI for Timelapse Aligner Pro
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -11,19 +11,25 @@ import numpy as np
 from PIL import Image, ImageTk
 
 # Import Core Logic
-import stabilize_parallel as stabilizer
+import timelapse_stabilizer as stabilizer
 from gui_visualizer import ManualAlignVisualizer
 from multiprocessing import freeze_support, Pool, cpu_count
 
 class AlignerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Antigravity Aligner Pro")
-        self.root.geometry("1200x800")
+        self.root.title("Timelapse Aligner Pro")
+        self.root.geometry("1400x900")
         
         # Data State
+        self.input_structure = {}       # {dataset_name: [full_path_images]}
+        self.dataset_paths = {}         # {dataset_name: full_path_to_folder}
+        self.dataset_is_root = False    # True if dataset_name is just "root" (single folder mode)
+        
+        self.excluded_files = set()     # Set of absolute paths
+        
         self.folder_analyses = {}       # {folder: [results]}
-        self.day_refine_targets = {}    # {folder: (dx, dy)}
+        self.day_gaps = {}              # {folder: (dx, dy)}
         self.sorted_folders = []        # [folder1, folder2, ...]
         self.current_transition_idx = -1
         
@@ -45,7 +51,10 @@ class AlignerApp:
         self.entry_input = ttk.Entry(self.top_frame, width=60)
         self.entry_input.grid(row=0, column=1, padx=5)
         self.entry_input.insert(0, os.path.abspath("input"))
+        self.entry_input.bind("<FocusOut>", self.on_input_change)
+        
         ttk.Button(self.top_frame, text="Browse", command=self.browse_input).grid(row=0, column=2)
+        ttk.Button(self.top_frame, text="Load / Scan Files", command=self.scan_input_structure).grid(row=0, column=3, padx=5)
         
         # Output
         ttk.Label(self.top_frame, text="Output Folder:").grid(row=1, column=0, sticky="w")
@@ -55,16 +64,20 @@ class AlignerApp:
         ttk.Button(self.top_frame, text="Browse", command=self.browse_output).grid(row=1, column=2)
         
         # Workers
-        ttk.Label(self.top_frame, text="Workers:").grid(row=0, column=3, padx=20)
+        ttk.Label(self.top_frame, text="Workers:").grid(row=1, column=3, padx=20)
         self.var_workers = tk.IntVar(value=max(1, cpu_count()-1))
         self.scale_workers = tk.Scale(self.top_frame, from_=1, to=16, orient="horizontal", variable=self.var_workers)
-        self.scale_workers.grid(row=0, column=4)
+        self.scale_workers.grid(row=1, column=4)
 
     def browse_input(self):
         path = filedialog.askdirectory()
         if path:
             self.entry_input.delete(0, tk.END)
             self.entry_input.insert(0, path)
+            self.scan_input_structure()
+            
+    def on_input_change(self, event=None):
+        self.scan_input_structure()
 
     def browse_output(self):
         path = filedialog.askdirectory()
@@ -76,42 +89,72 @@ class AlignerApp:
         self.paned = ttk.PanedWindow(self.root, orient="horizontal")
         self.paned.pack(fill="both", expand=True, padx=10, pady=5)
         
-        # Left: Transitions List
-        self.left_frame = ttk.Frame(self.paned, width=400)
-        self.paned.add(self.left_frame, weight=1)
+        # Left Panel (Tabs)
+        self.left_tabs = ttk.Notebook(self.paned, width=450)
+        self.paned.add(self.left_tabs, weight=1)
+        
+        # Tab 1: Source Files
+        self.tab_files = ttk.Frame(self.left_tabs)
+        self.left_tabs.add(self.tab_files, text="1. Source Files")
+        
+        self.tree_files = ttk.Treeview(self.tab_files, columns=("status", "size"), show="tree headings")
+        self.tree_files.heading("#0", text="Folder / File")
+        self.tree_files.heading("status", text="Status")
+        self.tree_files.heading("size", text="Size")
+        self.tree_files.column("#0", width=250)
+        self.tree_files.column("status", width=80)
+        self.tree_files.column("size", width=80)
+        
+        # Scroll
+        scroll_files = ttk.Scrollbar(self.tab_files, orient="vertical", command=self.tree_files.yview)
+        self.tree_files.configure(yscrollcommand=scroll_files.set)
+        
+        self.tree_files.pack(side="left", fill="both", expand=True)
+        scroll_files.pack(side="right", fill="y")
+        
+        self.tree_files.bind("<<TreeviewSelect>>", self.on_file_select)
+        self.tree_files.bind("<Double-1>", self.on_file_toggle)
+
+        # Tab 2: Transitions
+        self.tab_transitions = ttk.Frame(self.left_tabs)
+        self.left_tabs.add(self.tab_transitions, text="2. Transitions (Analysis)")
         
         columns = ("transition", "offset", "status")
-        self.tree = ttk.Treeview(self.left_frame, columns=columns, show="headings")
-        self.tree.heading("transition", text="Transition (Day -> Day)")
-        self.tree.heading("offset", text="Offset (dx, dy)")
-        self.tree.heading("status", text="Status")
-        self.tree.column("transition", width=250)
-        self.tree.column("offset", width=100)
-        self.tree.column("status", width=100)
+        self.tree_trans = ttk.Treeview(self.tab_transitions, columns=columns, show="headings")
+        self.tree_trans.heading("transition", text="Transition")
+        self.tree_trans.heading("offset", text="Offset")
+        self.tree_trans.heading("status", text="Status")
+        self.tree_trans.column("transition", width=200)
+        self.tree_trans.column("offset", width=100)
+        self.tree_trans.column("status", width=80)
         
-        self.tree.bind("<<TreeviewSelect>>", self.on_select_transition)
+        scroll_trans = ttk.Scrollbar(self.tab_transitions, orient="vertical", command=self.tree_trans.yview)
+        self.tree_trans.configure(yscrollcommand=scroll_trans.set)
         
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(self.left_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree_trans.pack(side="left", fill="both", expand=True)
+        scroll_trans.pack(side="right", fill="y")
         
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.tree_trans.bind("<<TreeviewSelect>>", self.on_select_transition)
         
         # Right: Preview Pane
-        self.right_frame = ttk.LabelFrame(self.paned, text="Alignment Verify", padding=10, width=400)
+        self.right_frame = ttk.LabelFrame(self.paned, text="Preview & Verify", padding=10, width=500)
         self.paned.add(self.right_frame, weight=1)
         
-        self.lbl_preview_title = ttk.Label(self.right_frame, text="Select a transition to preview", font=("Arial", 12))
+        self.lbl_preview_title = ttk.Label(self.right_frame, text="Select a file or transition", font=("Arial", 12))
         self.lbl_preview_title.pack(pady=5)
         
-        # Image Label
         self.lbl_image = ttk.Label(self.right_frame)
-        self.lbl_image.pack(pady=10)
+        self.lbl_image.pack(pady=5, expand=True)
         
-        # Controls
-        self.btn_edit = ttk.Button(self.right_frame, text="Edit Alignment Manually", command=self.open_visualizer, state="disabled")
-        self.btn_edit.pack(pady=10)
+        # Controls Frame
+        self.ctrl_frame = ttk.Frame(self.right_frame)
+        self.ctrl_frame.pack(fill="x", pady=10)
+        
+        self.btn_exclude = ttk.Button(self.ctrl_frame, text="Toggle Exclude File", command=self.toggle_current_file, state="disabled")
+        self.btn_exclude.pack(side="left", padx=5)
+        
+        self.btn_edit_align = ttk.Button(self.ctrl_frame, text="Edit Alignment Manually", command=self.open_visualizer, state="disabled")
+        self.btn_edit_align.pack(side="right", padx=5)
 
     def create_bottom_panel(self):
         self.bottom_frame = ttk.Frame(self.root, padding=10)
@@ -126,202 +169,313 @@ class AlignerApp:
         self.lbl_status = ttk.Label(self.bottom_frame, text="Ready.")
         self.lbl_status.pack(side="right", padx=10)
         
-    # --- Logic ---
+    # --- Logic: File Scanning ---
     
     def log(self, msg):
         self.lbl_status.config(text=msg)
         self.root.update_idletasks()
         
+    def scan_input_structure(self):
+        input_dir = self.entry_input.get()
+        if not os.path.exists(input_dir):
+            self.log("Input directory does not exist.")
+            return
+
+        self.log("Scanning files...")
+        self.tree_files.delete(*self.tree_files.get_children())
+        self.input_structure = {}
+        self.dataset_paths = {}
+        self.excluded_files = set() # Reset exclusions on new scan? Or keep matching names? Reset for safety.
+        
+        ext = "jpg"
+        
+        # 1. Check subfolders
+        subfolders = sorted([d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))])
+        
+        if subfolders:
+            self.dataset_is_root = False
+            total_imgs = 0
+            for d in subfolders:
+                full_d = os.path.join(input_dir, d)
+                imgs = stabilizer.get_images(full_d, ext)
+                if imgs:
+                    self.input_structure[d] = imgs
+                    self.dataset_paths[d] = full_d
+                    total_imgs += len(imgs)
+                    
+                    # Tree Node
+                    folder_node = self.tree_files.insert("", "end", text=d, values=("Dataset", f"{len(imgs)} files"))
+                    # Add files
+                    for img in imgs:
+                        fname = os.path.basename(img)
+                        size_mb = os.path.getsize(img) / (1024*1024)
+                        self.tree_files.insert(folder_node, "end", text=fname, values=("Active", f"{size_mb:.1f} MB"), tags=("file",))
+                        
+            self.log(f"Found {len(self.input_structure)} datasets ({total_imgs} images).")
+            
+        else:
+            # 2. Check root
+            imgs = stabilizer.get_images(input_dir, ext)
+            if imgs:
+                self.dataset_is_root = True
+                d_name = os.path.basename(input_dir)
+                self.input_structure[d_name] = imgs
+                self.dataset_paths[d_name] = input_dir
+                
+                # Tree Node
+                # For single dataset, list files directly or under a single root node?
+                # Using a single root node is cleaner.
+                folder_node = self.tree_files.insert("", "end", text=d_name, values=("Single Set", f"{len(imgs)} files"), open=True)
+                for img in imgs:
+                    fname = os.path.basename(img)
+                    size_mb = os.path.getsize(img) / (1024*1024)
+                    self.tree_files.insert(folder_node, "end", text=fname, values=("Active", f"{size_mb:.1f} MB"), tags=("file",))
+                    
+                self.log(f"Found {len(imgs)} images in root.")
+            else:
+                self.log("No images found.")
+                
+    def get_selected_file_path(self):
+        # Returns absolute path of selected file item
+        sel = self.tree_files.selection()
+        if not sel: return None
+        item_id = sel[0]
+        item = self.tree_files.item(item_id)
+        
+        if "file" not in self.tree_files.item(item_id, "tags"):
+            return None # Selected a folder
+            
+        fname = item['text']
+        parent_id = self.tree_files.parent(item_id)
+        parent_name = self.tree_files.item(parent_id)['text']
+        
+        # Find in structure (scan datasets)
+        # Note: parent_name matches d_name in input_structure keys
+        # But if dataset_is_root, input_structure key matches parent_name
+        
+        if parent_name in self.input_structure:
+             # Find full path ending with fname
+             for path in self.input_structure[parent_name]:
+                 if os.path.basename(path) == fname:
+                     return path
+        return None
+
+    def on_file_select(self, event):
+        path = self.get_selected_file_path()
+        if path:
+            self.show_preview_image(path)
+            # Update exclude button
+            if path in self.excluded_files:
+                self.btn_exclude.config(text="Restore File", state="normal")
+            else:
+                self.btn_exclude.config(text="Exclude File", state="normal")
+        else:
+            self.btn_exclude.config(state="disabled")
+            
+    def on_file_toggle(self, event):
+        self.toggle_current_file()
+        
+    def toggle_current_file(self):
+        path = self.get_selected_file_path()
+        if not path: return
+        
+        sel = self.tree_files.selection()[0]
+        
+        if path in self.excluded_files:
+            self.excluded_files.remove(path)
+            self.tree_files.item(sel, tags=("file",)) # Default style
+            self.tree_files.set(sel, "status", "Active")
+            self.btn_exclude.config(text="Exclude File")
+        else:
+            self.excluded_files.add(path)
+            self.tree_files.item(sel, tags=("file", "excluded"))
+            self.tree_files.set(sel, "status", "Excluded")
+            self.btn_exclude.config(text="Restore File")
+            
+        # Add visual style for excluded
+        self.tree_files.tag_configure("excluded", foreground="gray", font=("Arial", 9, "overstrike"))
+        self.tree_files.tag_configure("file", foreground="black", font=("Arial", 9))
+
+    def show_preview_image(self, path):
+        if not os.path.exists(path): return
+        
+        # Load and resize for preview
+        img = cv2.imread(path)
+        if img is None: return
+        
+        h, w = img.shape[:2]
+        display_w = 480
+        scale = display_w / w
+        display_h = int(h * scale)
+        
+        small = cv2.resize(img, (display_w, display_h))
+        small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        im_tk = ImageTk.PhotoImage(Image.fromarray(small))
+        
+        self.lbl_image.configure(image=im_tk)
+        self.lbl_image.image = im_tk
+        self.lbl_preview_title.config(text=os.path.basename(path))
+
+    # --- Logic: Analysis ---
+
     def run_analysis_thread(self):
+        if not self.input_structure:
+            messagebox.showerror("Error", "No files loaded. Please click 'Load / Scan Files' first.")
+            return
+            
         self.btn_analyze.config(state="disabled")
         self.btn_render.config(state="disabled")
-        self.tree.delete(*self.tree.get_children())
+        self.tree_trans.delete(*self.tree_trans.get_children())
         self.folder_analyses = {}
-        self.sorted_folders = []
         
         threading.Thread(target=self.run_analysis, daemon=True).start()
         
     def run_analysis(self):
-        input_dir = self.entry_input.get()
-        ext = "jpg"
         workers = self.var_workers.get()
         
-        try:
-            self.log("Scanning folders...")
-            subfolders = sorted([d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))])
-            if not subfolders:
-                self.log("No subfolders found!")
-                return
+        # Prepare Tasks with filtered lists
+        tasks = []
+        
+        for d_name, files in self.input_structure.items():
+            dataset_path = self.dataset_paths[d_name]
+            # Filter
+            valid_files = [f for f in files if f not in self.excluded_files]
+            
+            if len(valid_files) < 2:
+                self.root.after(0, self.log, f"Skipping {d_name} (Not enough files)")
+                continue
                 
-            tasks = [(os.path.join(input_dir, d), ext) for d in subfolders]
+            tasks.append((dataset_path, valid_files))
             
-            self.log(f"Analyzing {len(tasks)} folders...")
-            
-            # Using pool inside thread requires care, but stabilizer logic uses Pool.
-            # We will use multiprocessing pool provided by stabilizer logic logic in main thread usually, 
-            # here we call it directly. Note: Tkinter is not thread-safe, update UI via invoke.
-            
+        if not tasks:
+            self.root.after(0, self.log, "No valid datasets to analyze.")
+            self.root.after(0, lambda: self.btn_analyze.config(state="normal"))
+            return
+
+        self.root.after(0, lambda: self.left_tabs.select(self.tab_transitions))
+        self.root.after(0, self.log, f"Analyzing {len(tasks)} datasets...")
+        
+        try:
             results_map = {}
             with Pool(workers) as pool:
-                # We can't use tqdm easily here, just map
                 for i, (folder_name, results) in enumerate(pool.imap(stabilizer.analyze_folder_worker, tasks)):
                     results_map[folder_name] = results
                     self.root.after(0, self.log, f"Analyzed {i+1}/{len(tasks)}: {os.path.basename(folder_name)}")
                     
             self.folder_analyses = results_map
-            
-            # Initial Gap Calculation
-            self.root.after(0, self.log, "Calculating Gaps...")
-            self.day_refine_targets = stabilizer.calculate_day_gaps(self.folder_analyses)
             self.sorted_folders = sorted(self.folder_analyses.keys())
             
+            # Phase 2: Refinement
+            self.root.after(0, self.log, "Measuring Day Gaps...")
+            
+            refine_tasks = []
+            for i in range(len(self.sorted_folders)-1):
+                day1 = self.sorted_folders[i]
+                day2 = self.sorted_folders[i+1]
+                s1 = stabilizer.get_noon_samples_with_acc(self.folder_analyses[day1])
+                s2 = stabilizer.get_noon_samples_with_acc(self.folder_analyses[day2])
+                refine_tasks.append((day1, day2, s1, s2))
+                
+            day_gaps = {}
+            if refine_tasks:
+                with Pool(workers) as pool:
+                    for i, (day2, gap) in enumerate(pool.imap(stabilizer.measure_day_gap_worker, refine_tasks)):
+                        day_gaps[day2] = gap
+                        self.root.after(0, self.log, f"Measured gap for {os.path.basename(day2)}")
+            
+            self.day_gaps = day_gaps
+            
+            # UI
             self.root.after(0, self.populate_tree)
             self.root.after(0, lambda: self.btn_render.config(state="normal"))
             self.root.after(0, lambda: self.btn_analyze.config(state="normal"))
-            self.root.after(0, self.log, "Analysis Complete. Please Review.")
-            
+            self.root.after(0, self.log, "Analysis Complete.")
+
         except Exception as e:
-            self.root.after(0, self.log, f"Error: {str(e)}")
+            self.root.after(0, self.log, f"Error: {e}")
             self.root.after(0, lambda: self.btn_analyze.config(state="normal"))
 
     def populate_tree(self):
-        self.tree.delete(*self.tree.get_children())
-        
+        self.tree_trans.delete(*self.tree_trans.get_children())
         days = self.sorted_folders
-        # targets keyed by day2
-        
         for i in range(len(days)-1):
             day1 = days[i]
             day2 = days[i+1]
-            
-            tgt = self.day_refine_targets.get(day2, (0,0))
+            gap = self.day_gaps.get(day2, (0.0, 0.0))
             name1 = os.path.basename(day1)
             name2 = os.path.basename(day2)
-            
-            self.tree.insert("", "end", iid=str(i), values=(
+            self.tree_trans.insert("", "end", iid=str(i), values=(
                 f"{name1} -> {name2}",
-                f"{tgt[0]:.1f}, {tgt[1]:.1f}",
+                f"{gap[0]:.1f}, {gap[1]:.1f}",
                 "Auto"
             ))
 
     def on_select_transition(self, event):
-        sel = self.tree.selection()
+        # When selecting transition, switch preview to alignment mode
+        sel = self.tree_trans.selection()
         if not sel: return
-        
         idx = int(sel[0])
         self.current_transition_idx = idx
-        self.btn_edit.config(state="normal")
-        
-        self.update_preview(idx)
-        
-    def update_preview(self, idx):
+        self.btn_edit_align.config(state="normal")
+        self.update_align_preview(idx)
+
+    def update_align_preview(self, idx):
         day1 = self.sorted_folders[idx]
         day2 = self.sorted_folders[idx+1]
         
-        # Get noon samples
-        s1_list = stabilizer.get_noon_samples(self.folder_analyses[day1], n_samples=1)
-        s2_list = stabilizer.get_noon_samples(self.folder_analyses[day2], n_samples=1)
+        s1 = stabilizer.get_noon_samples_with_acc(self.folder_analyses[day1], n_samples=1)
+        s2 = stabilizer.get_noon_samples_with_acc(self.folder_analyses[day2], n_samples=1)
         
-        if not s1_list or not s2_list:
-            self.lbl_preview_title.config(text="No noon images found")
-            return
-            
-        p1 = s1_list[0]
-        p2 = s2_list[0]
+        if not s1 or not s2: return
         
-        img1 = cv2.imread(p1)
-        img2 = cv2.imread(p2)
+        samp1 = s1[0]
+        samp2 = s2[0]
+        img1 = cv2.imread(samp1['abs_path'])
+        img2 = cv2.imread(samp2['abs_path'])
         
-        # Current Offset for Day 2
-        # Note: day_refine_targets stores 'cumulative' offset for day2.
-        # But we want to show the relative alignment between Day 1 and Day 2.
-        # Day 1 also has a cumulative offset.
-        # RELATIVE GAP = Target(Day2) - Target(Day1)
+        gap = self.day_gaps.get(day2, (0.0, 0.0))
+        rel_dx, rel_dy = gap
         
-        t1 = self.day_refine_targets.get(day1, (0,0))
-        t2 = self.day_refine_targets.get(day2, (0,0))
+        self.lbl_preview_title.config(text=f"Transition: {os.path.basename(day1)} -> {os.path.basename(day2)}")
         
-        rel_dx = t2[0] - t1[0]
-        rel_dy = t2[1] - t1[1]
-        
-        self.lbl_preview_title.config(text=f"Relative Shift: {rel_dx:.1f}, {rel_dy:.1f}")
-        
-        # Generate Overlay
-        # Shift img2 by rel_dx, rel_dy
         h, w = img1.shape[:2]
         M = np.float32([[1, 0, rel_dx], [0, 1, rel_dy]])
         img2_shifted = cv2.warpAffine(img2, M, (w, h))
         
-        # Smart Crop (Center 300x300)
-        cw, ch = 300, 300
+        crop_sz = 300
         cx, cy = w//2, h//2
-        x1 = max(0, cx - cw//2)
-        y1 = max(0, cy - ch//2)
-        x2 = min(w, x1 + cw)
-        y2 = min(h, y1 + ch)
+        crop1 = img1[cy-crop_sz//2:cy+crop_sz//2, cx-crop_sz//2:cx+crop_sz//2]
+        crop2 = img2_shifted[cy-crop_sz//2:cy+crop_sz//2, cx-crop_sz//2:cx+crop_sz//2]
         
-        crop1 = img1[y1:y2, x1:x2]
-        crop2 = img2_shifted[y1:y2, x1:x2]
-        
-        # Blend
+        if crop1.size == 0 or crop2.size == 0:
+             # Fallback if image too small
+             crop1 = cv2.resize(img1, (crop_sz, crop_sz))
+             crop2 = cv2.resize(img2_shifted, (crop_sz, crop_sz))
+
         blend = cv2.addWeighted(crop1, 0.6, crop2, 0.4, 0)
-        
-        # Convert to TK
         blend = cv2.cvtColor(blend, cv2.COLOR_BGR2RGB)
-        im_pil = Image.fromarray(blend)
-        im_tk = ImageTk.PhotoImage(im_pil)
+        im_tk = ImageTk.PhotoImage(Image.fromarray(blend))
         
         self.lbl_image.configure(image=im_tk)
-        self.lbl_image.image = im_tk # Keep ref
+        self.lbl_image.image = im_tk
 
     def open_visualizer(self):
         if self.current_transition_idx < 0: return
-        
         idx = self.current_transition_idx
         day1 = self.sorted_folders[idx]
         day2 = self.sorted_folders[idx+1]
+        s1 = stabilizer.get_noon_samples_with_acc(self.folder_analyses[day1], n_samples=1)[0]
+        s2 = stabilizer.get_noon_samples_with_acc(self.folder_analyses[day2], n_samples=1)[0]
+        gap = self.day_gaps.get(day2, (0.0, 0.0))
         
-        s1 = stabilizer.get_noon_samples(self.folder_analyses[day1], n_samples=1)[0]
-        s2 = stabilizer.get_noon_samples(self.folder_analyses[day2], n_samples=1)[0]
-        
-        # Calculate current relative offset
-        t1 = self.day_refine_targets.get(day1, (0,0))
-        t2 = self.day_refine_targets.get(day2, (0,0))
-        rel_dx = t2[0] - t1[0]
-        rel_dy = t2[1] - t1[1]
-        
-        vis = ManualAlignVisualizer(s1, s2, initial_dx=rel_dx, initial_dy=rel_dy)
+        vis = ManualAlignVisualizer(s1['abs_path'], s2['abs_path'], initial_dx=gap[0], initial_dy=gap[1])
         new_dx, new_dy = vis.run()
         
         if new_dx is not None:
-            # Update Target
-            # New Target(Day2) = Target(Day1) + NewRelative
-            updated_t2_dx = t1[0] + new_dx
-            updated_t2_dy = t1[1] + new_dy
-            
-            self.day_refine_targets[day2] = (updated_t2_dx, updated_t2_dy)
-            
-            # Propagate change to future days?
-            # Yes, if we shift Day 2, Day 3's relative position to Day 2 stays same, 
-            # so Day 3's absolute target must shift by the delta.
-            delta_dx = updated_t2_dx - t2[0]
-            delta_dy = updated_t2_dy - t2[1]
-            
-            for k in range(idx + 2, len(self.sorted_folders)):
-                future_day = self.sorted_folders[k]
-                old_tgt = self.day_refine_targets[future_day]
-                self.day_refine_targets[future_day] = (old_tgt[0] + delta_dx, old_tgt[1] + delta_dy)
-            
-            # Refresh UI
+            self.day_gaps[day2] = (new_dx, new_dy)
             self.populate_tree()
-            self.tree.selection_set(str(idx)) # Keep selection
-            self.item_set_status(idx, "Manual")
-            self.update_preview(idx)
-
-    def item_set_status(self, idx, status):
-        # Helper to update tree item status
-        current = self.tree.item(str(idx), "values")
-        self.tree.item(str(idx), values=(current[0], current[1], status))
+            self.tree_trans.selection_set(str(idx))
+            self.update_align_preview(idx)
 
     def run_render_thread(self):
         self.btn_render.config(state="disabled")
@@ -331,37 +485,33 @@ class AlignerApp:
     def run_render(self):
         try:
             self.log("Integrating trajectory...")
-            global_traj = stabilizer.integrate_trajectory(self.folder_analyses, self.day_refine_targets)
+            global_traj = stabilizer.integrate_trajectory(self.folder_analyses, self.day_gaps)
             
             output_dir = self.entry_output.get()
             if os.path.exists(output_dir):
                 shutil.rmtree(output_dir)
-            os.makedirs(output_dir)
             
-            # Render Tasks
-            subfolders = self.sorted_folders
             render_tasks = []
-            for folder in subfolders:
+            for folder in self.sorted_folders:
                 render_tasks.append((
-                    folder,  # Input full path
-                    os.path.join(output_dir, os.path.basename(folder)), # Output full path
+                    folder,
+                    os.path.join(output_dir, os.path.basename(folder)),
                     global_traj[folder]
                 ))
             
             workers = self.var_workers.get()
-            self.log("Rendering frames...")
-            
+            self.log("Rendering filters...")
             with Pool(workers) as pool:
                 for i, _ in enumerate(pool.imap(stabilizer.render_folder_worker, render_tasks)):
-                    self.root.after(0, self.log, f"Rendered dataset {i+1}/{len(render_tasks)}")
+                    self.root.after(0, self.log, f"Rendered {i+1}/{len(render_tasks)}")
                     
-            self.root.after(0, self.log, "Rendering Complete! Check output folder.")
+            self.root.after(0, self.log, "Rendering Complete!")
             self.root.after(0, lambda: self.btn_render.config(state="normal"))
             self.root.after(0, lambda: self.btn_analyze.config(state="normal"))
-            messagebox.showinfo("Success", "Rendering Finished!")
+            messagebox.showinfo("Success", "Finished!")
             
         except Exception as e:
-            self.root.after(0, self.log, f"Error: {str(e)}")
+            self.root.after(0, self.log, f"Error: {e}")
             self.root.after(0, lambda: self.btn_render.config(state="normal"))
 
 if __name__ == "__main__":

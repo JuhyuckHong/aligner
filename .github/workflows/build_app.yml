@@ -14,14 +14,14 @@ jobs:
         include:
           - os: macos-latest
             TARGET: macos
-            CMD_BUILD: pyinstaller --noconfirm --onedir --windowed --name "AntigravityAligner" gui_main.py
-            OUT_PATH: dist/AntigravityAligner.app
-            ARTIFACT_NAME: AntigravityAligner-Mac
+            CMD_BUILD: pyinstaller --noconfirm --onedir --windowed --name "TimelapseAligner" gui_main.py
+            OUT_PATH: dist/TimelapseAligner.app
+            ARTIFACT_NAME: TimelapseAligner-Mac
           - os: windows-latest
             TARGET: windows
-            CMD_BUILD: pyinstaller --noconfirm --onedir --windowed --name "AntigravityAligner" gui_main.py
-            OUT_PATH: dist/AntigravityAligner
-            ARTIFACT_NAME: AntigravityAligner-Windows
+            CMD_BUILD: pyinstaller --noconfirm --onedir --windowed --name "TimelapseAligner" gui_main.py
+            OUT_PATH: dist/TimelapseAligner
+            ARTIFACT_NAME: TimelapseAligner-Windows
 
     steps:
     - uses: actions/checkout@v3
@@ -44,13 +44,13 @@ jobs:
       if: matrix.TARGET == 'macos'
       run: |
         cd dist
-        zip -r AntigravityAligner-Mac.zip AntigravityAligner.app
+        zip -r TimelapseAligner-Mac.zip TimelapseAligner.app
 
     # Windows Specific: Zip the folder
     - name: Zip Windows App
       if: matrix.TARGET == 'windows'
       run: |
-        powershell Compress-Archive -Path dist/AntigravityAligner -DestinationPath dist/AntigravityAligner-Windows.zip
+        powershell Compress-Archive -Path dist/TimelapseAligner -DestinationPath dist/TimelapseAligner-Windows.zip
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v3
