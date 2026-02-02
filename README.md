@@ -5,6 +5,8 @@
 ## ✨ 주요 기능 (Key Features)
 - **Zero Drift PID Control**: PID 제어기(비례-적분-미분)와 Global Anchor 전략을 통해 장기간 타임랩스에서도 드리프트(위치/회전 누적 오차)를 완벽하게 제거합니다.
 - **Robust Rotation Correction**: Gradient 기반 ECC 알고리즘(반복 횟수 500회)을 사용하여 조명 변화가 심한 환경에서도 미세한 회전을 정밀하게 감지합니다.
+- **Smart Dark Removal**: 이미지 중심부 밝기를 분석하여 너무 어두운(밤/새벽) 이미지는 분석 및 결과에서 자동으로 제외합니다 (Threshold 60.0).
+- **Uniform Brightness**: 모든 결과 프레임의 밝기를 균일하게 정규화(Normalization)하여 플리커(깜빡임) 없는 영상을 생성합니다. (화질 저하 방지를 위한 Safe Limit 적용)
 - **Subfolder & Range Support**: 특정 프로젝트 폴더 및 날짜 범위를 지정하여 부분 처리가 가능합니다.
 - **Parallel Processing**: 멀티코어를 활용한 고속 병렬 분석 및 렌더링.
 - **Resuming**: 단계별 분석 로그(JSON) 자동 저장으로 중단된 지점부터 재개 가능.
@@ -65,27 +67,32 @@ python evaluate_stabilization.py --subfolder MyProject
 
 **1. 개별 프레임 분석 (Analysis Logic):**
 ```text
-[입력 이미지] -> [Gradient 변환 (조명 강인성 확보)]
+[입력 이미지] 
+    │
+    ▼
+[Center Crop 밝기 분석] ──(Dark)──> [제거/Skip]
+    │ (Pass)
+    ▼
+[Gradient 변환 (조명 강인성 확보)]
+    │
+    ├───> [ECC 정밀 회전 감지 (500iter)]
+    │           │
+    │     [이미지 역회전]
+    │           │
+    └───────> [Phase Correlation] 
                       │
-            ┌─────────┴─────────┐
-         [ECC 정밀 회전 감지 (500iter)]
-            │                   
-      [이미지 역회전]         
-            │                   
-            └────> [Phase Correlation] 
-                           │
-                 [최종 변위(dx, dy) 계산]
+            [최종 변위(dx, dy) 계산]
 ```
 
 **2. 전체 처리 파이프라인 (Parallel Pipeline):**
 ```text
-[Step 1: Analysis]   -> 각 폴더 병렬 분석 (Frame-by-Frame Motion) -> analysis_log.json
+[Step 1: Analysis]   -> 각 폴더 병렬 분석 (Dark Filtering Included) -> analysis_log.json
         │
 [Step 2: Refinement] -> [Day 1 vs Day N] Global Anchor 정합 -> refine_log.json
         │
 [Step 3: Integration]-> PID 제어기 적용 (Smooth & Zero Drift) -> full_log.txt
         │
-[Step 4: Rendering]  -> 최종 좌표로 이미지 변환(Warp) 및 저장    -> Output Images
+[Step 4: Rendering]  -> [Warp] 변환 -> [Brightness Normalization] -> Output Images
 ```
 
 ---
@@ -116,7 +123,7 @@ project/
 **최종 로그 (`full_log.txt`)**:
 - **dx/dy**: 최종 보정된 이동량 (Absolute Pixels)
 - **rot**: 최종 보정된 회전각 (Degree)
-- **status**: `ROT(angle)` 등 상태 정보
+- **status**: `OK`, `DARK` (제거됨), `ROT(angle)` 등 상태 정보
 
 ---
 

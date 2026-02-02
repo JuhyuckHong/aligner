@@ -38,6 +38,10 @@ ROTATION_THRESHOLD_DEG = 0.02
 DAMPING_DEADZONE = 3.0
 DAMPING_FACTOR = 1.0
 
+# Brightness/Darkness Thresholds
+DARK_THRESHOLD = 60.0   # Images with mean brightness below this are ignored
+TARGET_BRIGHTNESS = 110.0 # Target mean brightness for normalization
+
 # Refinement Precision
 DAY_REFINE_SAMPLES = 7 
 ECC_ITERATIONS = 500  # Increased for better convergence
@@ -103,6 +107,88 @@ def get_euclidean_transform(ref_gray, mov_gray):
         return angle, dx, dy, True
     except:
         return 0, 0, 0, False
+        return 0, 0, 0, False
+
+def is_image_dark(img, threshold=DARK_THRESHOLD):
+    """
+    Checks if an image is too dark (night time).
+    """
+    if img is None: return True
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Crop center 50%
+    h, w = gray.shape
+    h_start, h_end = int(h * 0.25), int(h * 0.75)
+    w_start, w_end = int(w * 0.25), int(w * 0.75)
+    
+    center_crop = gray[h_start:h_end, w_start:w_end]
+    mean_brightness = np.mean(center_crop)
+    return mean_brightness, (mean_brightness < threshold)
+
+def smooth_array(data, window_size=15):
+    """Simple moving average smoothing with edge padding."""
+    if not data or len(data) < window_size:
+        return data
+    
+    # Convert to float array
+    arr = np.array(data, dtype=np.float32)
+    pad_size = window_size // 2
+    
+    # Pad with edge values
+    padded = np.pad(arr, (pad_size, pad_size), mode='edge')
+    
+    # Convolve
+    kernel = np.ones(window_size) / window_size
+    smoothed = np.convolve(padded, kernel, mode='valid')
+    
+    # Handle length mismatch due to padding/valid mode quirks if any
+    if len(smoothed) > len(data):
+        smoothed = smoothed[:len(data)]
+    elif len(smoothed) < len(data):
+        # Fallback (should not happen with correct padding)
+        smoothed = np.pad(smoothed, (0, len(data) - len(smoothed)), mode='edge')
+        
+    return smoothed
+
+def normalize_brightness(img, target=TARGET_BRIGHTNESS):
+    """
+    Normalizes the brightness of an image to match the target mean.
+    Uses HSV Value channel scaling.
+    """
+    if img is None: return img
+    
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    
+    current_mean = np.mean(v)
+    if current_mean < 10: # Too dark to normalize properly to target
+        return img
+        
+    scale = target / current_mean
+    # Clamp scale to prevent quality degradation (noise amplification or excessive darkening)
+    scale = np.clip(scale, 0.7, 1.5) 
+    
+    # Apply scale and clip to valid range
+    v = cv2.multiply(v, scale)
+    v = np.clip(v, 0, 255).astype(np.uint8)
+    
+    hsv_norm = cv2.merge([h, s, v])
+    return cv2.cvtColor(hsv_norm, cv2.COLOR_HSV2BGR)
+
+def apply_brightness_scale(img, scale):
+    """
+    Multiplies the V channel by a specific scale factor.
+    """
+    if img is None or scale == 1.0: return img
+    
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    
+    v = cv2.multiply(v, scale)
+    v = np.clip(v, 0, 255).astype(np.uint8)
+    
+    hsv_norm = cv2.merge([h, s, v])
+    return cv2.cvtColor(hsv_norm, cv2.COLOR_HSV2BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +236,8 @@ def analyze_folder_worker(args):
         "filename": os.path.basename(images[0]),
         "abs_path": images[0],
         "dx": 0.0, "dy": 0.0, "rot": 0.0,
-        "status": "OK"
+        "status": "OK",
+        "brightness": float(np.mean(create_gradient(prev_small))) * 0 + float(is_image_dark(prev_img)[0]) # Hack to get brightness
     })
     
     # ECC Criteria from README (500 iterations)
@@ -172,6 +259,18 @@ def analyze_folder_worker(args):
                 "filename": curr_fname, "abs_path": curr_path,
                 "dx": 0.0, "dy": 0.0, "rot": 0.0, "status": "FAIL_READ"
             })
+            continue
+
+        # Check for Dark Image
+        b_val, is_dark = is_image_dark(curr_img)
+        
+        if is_dark:
+            results.append({
+                "filename": curr_fname, "abs_path": curr_path,
+                "dx": 0.0, "dy": 0.0, "rot": 0.0, "status": "DARK",
+                "brightness": float(b_val)
+            })
+            # Skip updating prev_grad, as this frame is invalid.
             continue
             
         curr_small = cv2.resize(curr_img, None, fx=scale, fy=scale)
@@ -241,7 +340,8 @@ def analyze_folder_worker(args):
             "dx": float(final_dx),
             "dy": float(final_dy),
             "rot": float(d_rot),
-            "status": status
+            "status": status,
+            "brightness": float(b_val)
         })
         
         prev_grad = curr_grad
@@ -434,7 +534,13 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
         
         folder_trajectory = []
         
+        folder_trajectory = []
+        
         for idx, frame in enumerate(frames):
+            # FILTER DARK IMAGES HERE
+            if frame['status'] == "DARK":
+                continue
+                
             local_acc_dx += frame['dx']
             local_acc_dy += frame['dy']
             local_acc_rot += frame['rot']
@@ -462,6 +568,43 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
                 "status": frame['status']
             })
             
+        # --- Temporal Brightness Smoothing ---
+        # 1. Extract valid brightness values
+        raw_brightness = []
+        valid_indices = []
+        for i, item in enumerate(folder_trajectory):
+            # Try to get brightness from original frame data
+            # We need to look up the original frame in 'frames' list to get 'brightness'
+            # But folder_trajectory indices map 1:1 to 'frames' minus skipped darks
+            # Actually, we removed darks, so we need to match carefully.
+            # Simplified: store 'brightness' in folder_trajectory during loop above
+            pass
+
+        # Re-loop to update brightness in trajectory
+        # Actually easier to do it in one go.
+        # Let's collect brightness from the filtered 'frames' used in trajectory
+        filtered_frames = [f for f in frames if f['status'] != "DARK"]
+        
+        if filtered_frames:
+            raw_b = [f.get('brightness', 110.0) for f in filtered_frames]
+            
+            # Smooth
+            smoothed_b = smooth_array(raw_b, window_size=15)
+            
+            # Calculate Scale
+            # scale = smoothed / raw
+            # raw can be 0 (theoretically), but threshold is 60, so safe.
+            for i, item in enumerate(folder_trajectory):
+                rb = raw_b[i]
+                sb = smoothed_b[i]
+                if rb > 1.0:
+                    scale = sb / rb
+                    # Clamp for safety
+                    scale = np.clip(scale, 0.8, 1.25) # Gentle correction
+                else:
+                    scale = 1.0
+                item['brightness_scale'] = float(scale)
+                
         global_trajectory[folder] = folder_trajectory
         
         current_global_dx = start_dx + local_acc_dx + refine_gap_dx
@@ -505,6 +648,10 @@ def render_folder_worker(args):
         
         aligned = cv2.warpAffine(img, M, (w, h), 
                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        
+        # Normalize Brightness (Temporal Smoothing)
+        b_scale = item.get('brightness_scale', 1.0)
+        aligned = apply_brightness_scale(aligned, b_scale)
         
         cv2.imwrite(os.path.join(output_dir, item['filename']), aligned, [cv2.IMWRITE_JPEG_QUALITY, 98])
         
@@ -629,7 +776,7 @@ def run_stabilization_task(input_root, output_root, log_prefix, place_name, args
         with open(full_log_path, "w") as f:
             for folder in sorted(global_traj.keys()):
                 for item in global_traj[folder]:
-                    f.write(f"{folder}\t{item['filename']}\tdx={item['final_dx']:.1f}\tdy={item['final_dy']:.1f}\trot={item['rot']:.3f}\tstatus={item['status']}\n")
+                    f.write(f"{folder}\t{item['filename']}\tdx={item['final_dx']:.1f}\tdy={item['final_dy']:.1f}\trot={item['rot']:.3f}\tstatus={item['status']}\tscale={item.get('brightness_scale', 1.0):.3f}\n")
 
     # === Phase 4: Rendering ===
     print(f"\n[Phase 4] Rendering frames for {len(valid_folders)} folders...")
@@ -657,7 +804,8 @@ def run_stabilization_task(input_root, output_root, log_prefix, place_name, args
                     "final_dx": float(kv['dx']),
                     "final_dy": float(kv['dy']),
                     "rot": float(kv['rot']),
-                    "status": kv['status']
+                    "status": kv['status'],
+                    "brightness_scale": float(kv.get('scale', 1.0))
                 })
 
     render_tasks = []

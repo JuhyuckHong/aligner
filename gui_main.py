@@ -50,7 +50,7 @@ class AlignerApp:
         ttk.Label(self.top_frame, text="원본 사진 폴더:").grid(row=0, column=0, sticky="w")
         self.entry_input = ttk.Entry(self.top_frame, width=60)
         self.entry_input.grid(row=0, column=1, padx=5)
-        self.entry_input.insert(0, os.path.abspath("input"))
+        self.entry_input.insert(0, r"\\Buildmotion")
         self.entry_input.bind("<FocusOut>", self.on_input_change)
         
         ttk.Button(self.top_frame, text="폴더 찾기", command=self.browse_input).grid(row=0, column=2)
@@ -60,7 +60,7 @@ class AlignerApp:
         ttk.Label(self.top_frame, text="저장될 폴더:").grid(row=1, column=0, sticky="w")
         self.entry_output = ttk.Entry(self.top_frame, width=60)
         self.entry_output.grid(row=1, column=1, padx=5)
-        self.entry_output.insert(0, os.path.abspath("output"))
+        self.entry_output.insert(0, r"\\Buildmotion\NAS_LOG")
         ttk.Button(self.top_frame, text="폴더 찾기", command=self.browse_output).grid(row=1, column=2)
         
         # Workers
@@ -81,17 +81,21 @@ class AlignerApp:
         self.scale_workers.grid(row=1, column=4)
 
     def browse_input(self):
-        path = filedialog.askdirectory()
+        current = self.entry_input.get()
+        initialdir = current if os.path.exists(current) else None
+        path = filedialog.askdirectory(initialdir=initialdir)
         if path:
             self.entry_input.delete(0, tk.END)
             self.entry_input.insert(0, path)
             self.scan_input_structure()
-            
+
     def on_input_change(self, event=None):
         self.scan_input_structure()
 
     def browse_output(self):
-        path = filedialog.askdirectory()
+        current = self.entry_output.get()
+        initialdir = current if os.path.exists(current) else None
+        path = filedialog.askdirectory(initialdir=initialdir)
         if path:
             self.entry_output.delete(0, tk.END)
             self.entry_output.insert(0, path)
@@ -397,8 +401,13 @@ class AlignerApp:
         self.tree_files.tag_configure("file", foreground="black", font=("Arial", 9))
         self.tree_files.tag_configure("folder_excluded", foreground="red", font=("Arial", 9, "overstrike"))
         
-        # 1. Check subfolders
-        subfolders = sorted([d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))])
+        # 1. Check subfolders (exclude output directory)
+        output_dir = os.path.normpath(self.entry_output.get())
+        subfolders = sorted([
+            d for d in os.listdir(input_dir)
+            if os.path.isdir(os.path.join(input_dir, d))
+            and os.path.normpath(os.path.join(input_dir, d)) != output_dir
+        ])
         
         if subfolders:
             self.dataset_is_root = False
