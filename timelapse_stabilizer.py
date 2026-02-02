@@ -104,13 +104,22 @@ def get_euclidean_transform(ref_gray, mov_gray):
     except:
         return 0, 0, 0, False
 
+
 # ---------------------------------------------------------------------------
 # PHASE 1: Analysis (Worker)
 # ---------------------------------------------------------------------------
 def analyze_folder_worker(args):
-    # args can be (input_dir, ext) OR (input_dir, image_list)
+    # args can be:
+    # (input_dir, ext)
+    # (input_dir, image_list)
+    # (input_dir, image_list, progress_queue)
+    
     input_dir = args[0]
     second_arg = args[1]
+    progress_queue = None
+    
+    if len(args) >= 3:
+        progress_queue = args[2]
     
     if isinstance(second_arg, str):
         ext = second_arg
@@ -125,66 +134,117 @@ def analyze_folder_worker(args):
     scale = 0.5
     
     prev_img = cv2.imread(images[0])
-    prev_gray = cv2.cvtColor(prev_img, cv2.COLOR_BGR2GRAY)
-    prev_gray_small = cv2.resize(prev_gray, None, fx=scale, fy=scale)
-    prev_grad = create_gradient(prev_img)
-    prev_grad_small = cv2.resize(prev_grad, None, fx=scale, fy=scale)
+    if prev_img is None:
+        return (os.path.basename(input_dir), [])
+
+    folder_name = os.path.basename(input_dir)
+            
+    # Use Gradient for robustness as per README
+    # Resize first to speed up
+    prev_small = cv2.resize(prev_img, None, fx=scale, fy=scale)
+    prev_grad = create_gradient(prev_small)
+    h, w = prev_grad.shape
     
-    # First frame
+    # Init first result
     results.append({
         "filename": os.path.basename(images[0]),
-        "rel_dx": 0.0, "rel_dy": 0.0, "rot": 0.0,
-        "status": "FIRST", "abs_path": images[0]
+        "abs_path": images[0],
+        "dx": 0.0, "dy": 0.0, "rot": 0.0,
+        "status": "OK"
     })
+    
+    # ECC Criteria from README (500 iterations)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 500, 1e-4)
     
     for i in range(1, len(images)):
         curr_path = images[i]
+        curr_fname = os.path.basename(curr_path)
+        
+        # Report Progress
+        if progress_queue:
+            progress_queue.put(('P_INC', 1))
+            if i % 10 == 0:
+                progress_queue.put(f"[Analyzing] {folder_name}: {i}/{len(images)}")
+            
         curr_img = cv2.imread(curr_path)
-        filename = os.path.basename(curr_path)
+        if curr_img is None:
+            results.append({
+                "filename": curr_fname, "abs_path": curr_path,
+                "dx": 0.0, "dy": 0.0, "rot": 0.0, "status": "FAIL_READ"
+            })
+            continue
+            
+        curr_small = cv2.resize(curr_img, None, fx=scale, fy=scale)
+        curr_grad = create_gradient(curr_small)
         
-        curr_gray = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY)
-        curr_gray_small = cv2.resize(curr_gray, None, fx=scale, fy=scale)
-        curr_grad = create_gradient(curr_img)
-        curr_grad_small = cv2.resize(curr_grad, None, fx=scale, fy=scale)
+        # --- Algorithm per README ---
+        # 1. Gradient (Already done: prev_grad, curr_grad)
+        # 2. ECC Rotation Detection
         
-        # 1. Translation
-        dx, dy, resp = phase_correlation(prev_grad_small, curr_grad_small)
-        dx /= scale
-        dy /= scale
-        
-        # 2. Rotation
-        angle, ecc_dx, ecc_dy, ecc_ok = get_euclidean_transform(prev_grad_small, curr_grad_small)
-        
-        final_dx, final_dy = dx, dy
-        final_rot = 0.0
+        d_rot = 0.0
+        d_dx = 0.0
+        d_dy = 0.0
         status = "OK"
         
-        if ecc_ok and abs(angle) > ROTATION_THRESHOLD_DEG:
-            status = f"ROT({angle:.2f})"
-            final_rot = angle
+        try:
+            # Init warp with identity
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
             
-            # Derotate and Re-measure Translation
-            center = (curr_grad_small.shape[1] // 2, curr_grad_small.shape[0] // 2)
-            M_derot = cv2.getRotationMatrix2D(center, angle, 1.0)
-            curr_grad_derot = cv2.warpAffine(curr_grad_small, M_derot, 
-                                             (curr_grad_small.shape[1], curr_grad_small.shape[0]),
-                                             flags=cv2.INTER_LINEAR)
+            # Run ECC (Euclidean: Rot + Trans)
+            # README says "ECC 정밀 회전 감지"
+            (_, warp_matrix) = cv2.findTransformECC(prev_grad, curr_grad, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria)
             
-            pc_dx, pc_dy, _ = phase_correlation(prev_grad_small, curr_grad_derot)
-            final_dx = pc_dx / scale
-            final_dy = pc_dy / scale
-        
-        if i % 50 == 0:
-            print(f"  [Analyze] {os.path.basename(input_dir)}: {i}/{len(images)}", flush=True)
+            # Extract Rotation
+            rot_rad = np.arctan2(warp_matrix[1, 0], warp_matrix[0, 0])
+            d_rot = np.degrees(rot_rad)
+            
+            # 3. Derotate (Inverse Rotation) for Phase Correlation
+            center = (w // 2, h // 2)
+            M_derot = cv2.getRotationMatrix2D(center, d_rot, 1.0)
+            curr_grad_derot = cv2.warpAffine(curr_grad, M_derot, (w, h))
+            
+            # 4. Phase Correlation for Translation
+            # Use derotated gradient vs previous gradient
+            prev_hann = (prev_grad.astype(np.float32) * np.hanning(w) * np.hanning(h)[:, None])
+            curr_hann = (curr_grad_derot.astype(np.float32) * np.hanning(w) * np.hanning(h)[:, None])
+            
+            shift, _ = cv2.phaseCorrelate(prev_hann, curr_hann)
+            p_dx, p_dy = shift
+            
+            # Final dx/dy is a combination of ECC's rough trans (if we used it) or purely PhaseCorr.
+            # README diagram implies: [ECC (Rot)] -> [Derotate] -> [PhaseCorr (Trans)]
+            # So we use PhaseCorr result as the translation.
+            # Note: PhaseCorrelation gives translation of 'curr' relative to 'prev'.
+            # Result is (dx, dy).
+            d_dx = p_dx
+            d_dy = p_dy
+            
+            if abs(d_rot) > 0.1:
+                status = f"ROT({d_rot:.2f})"
+                
+        except Exception as e:
+            # Fallback if ECC fails: just PhaseCorr on raw gradients
+            prev_hann = (prev_grad.astype(np.float32) * np.hanning(w) * np.hanning(h)[:, None])
+            curr_hann = (curr_grad.astype(np.float32) * np.hanning(w) * np.hanning(h)[:, None])
+            shift, _ = cv2.phaseCorrelate(prev_hann, curr_hann)
+            d_dx, d_dy = shift
+            status = "ECC_FAIL"
+
+        # Scale back to original resolution
+        final_dx = d_dx / scale
+        final_dy = d_dy / scale
+        # Rotation is invariant to scale
 
         results.append({
-            "filename": filename,
-            "rel_dx": float(final_dx), "rel_dy": float(final_dy), "rot": float(final_rot),
-            "status": status, "abs_path": curr_path
+            "filename": curr_fname,
+            "abs_path": curr_path,
+            "dx": float(final_dx),
+            "dy": float(final_dy),
+            "rot": float(d_rot),
+            "status": status
         })
         
-        prev_gray_small = curr_gray_small
-        prev_grad_small = curr_grad_small
+        prev_grad = curr_grad
         
     return (os.path.basename(input_dir), results)
 
@@ -201,8 +261,8 @@ def get_noon_samples_with_acc(analysis_list, n_samples=DAY_REFINE_SAMPLES):
     accumulated_data = []
     
     for item in analysis_list:
-        acc_dx += item['rel_dx']
-        acc_dy += item['rel_dy']
+        acc_dx += item['dx']
+        acc_dy += item['dy']
         acc_rot += item['rot']
         
         try:
@@ -375,8 +435,8 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
         folder_trajectory = []
         
         for idx, frame in enumerate(frames):
-            local_acc_dx += frame['rel_dx']
-            local_acc_dy += frame['rel_dy']
+            local_acc_dx += frame['dx']
+            local_acc_dy += frame['dy']
             local_acc_rot += frame['rot']
             
             # if abs(local_acc_dx) > DAMPING_DEADZONE: local_acc_dx *= DAMPING_FACTOR
@@ -414,10 +474,21 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
 # PHASE 4: Rendering
 # ---------------------------------------------------------------------------
 def render_folder_worker(args):
-    input_dir, output_dir, trajectory = args
+    # args can be (input_dir, output_dir, trajectory) 
+    # OR (input_dir, output_dir, trajectory, progress_queue)
+    input_dir = args[0]
+    output_dir = args[1]
+    trajectory = args[2]
+    progress_queue = None
+    if len(args) >= 4:
+        progress_queue = args[3]
+        
     os.makedirs(output_dir, exist_ok=True)
     
     for idx, item in enumerate(trajectory):
+        if progress_queue:
+            progress_queue.put(('P_INC', 1))
+
         img = cv2.imread(item['abs_path'])
         if img is None: continue
             
@@ -438,40 +509,20 @@ def render_folder_worker(args):
         cv2.imwrite(os.path.join(output_dir, item['filename']), aligned, [cv2.IMWRITE_JPEG_QUALITY, 98])
         
         if idx % 50 == 0:
-            print(f"  [Render] {os.path.basename(input_dir)}: {idx}/{len(trajectory)} (rot={rot:.4f})", flush=True)
+            if progress_queue:
+                progress_queue.put(f"[Rendering] {os.path.basename(input_dir)}: {idx}/{len(trajectory)}")
+            else:
+                print(f"  [Render] {os.path.basename(input_dir)}: {idx}/{len(trajectory)} (rot={rot:.4f})", flush=True)
     
     return len(trajectory)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", default="input")
-    parser.add_argument("--output", "-o", default="output")
-    parser.add_argument("--subfolder", "-f", help="Subfolder name inside input directory")
-    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", help="End date (YYYY-MM-DD)")
-    parser.add_argument("--ext", default="jpg")
-    parser.add_argument("--workers", "-w", type=int, default=max(1, cpu_count()-1))
-    parser.add_argument("--video", action="store_true")
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--force-analyze", action="store_true")
-    parser.add_argument("--force-refine", action="store_true")
-    parser.add_argument("--render-only", action="store_true")
-    parser.add_argument("--resize-width", type=int, help="Target video width (e.g. 1920)")
-    args = parser.parse_args()
-    
-    # Path Resolution
-    if args.subfolder:
-        input_root = os.path.join(args.input, args.subfolder)
-        output_root = os.path.join(args.output, args.subfolder)
-        log_prefix = f"{args.subfolder}_"
-    else:
-        input_root = args.input
-        output_root = args.output
-        log_prefix = ""
-        
+def run_stabilization_task(input_root, output_root, log_prefix, place_name, args):
+    """
+    Executes the stabilization pipeline for a single place/folder.
+    """
     os.makedirs(output_root, exist_ok=True)
     
     analysis_log_path = os.path.join(output_root, f"{log_prefix}analysis_log.json")
@@ -629,7 +680,7 @@ def main():
         end_d = valid_folders[-1]
         res_str = f"{args.resize_width}p" if args.resize_width else "Original"
         now_str = datetime.now().strftime("%H%M%S")
-        sub_name = args.subfolder if args.subfolder else "timelapse"
+        sub_name = place_name if place_name else "timelapse"
         vid_filename = f"{sub_name}_{start_d}~{end_d}_{res_str}_{now_str}.mp4"
         vid_path = os.path.join(output_root, vid_filename)
         
@@ -643,6 +694,68 @@ def main():
             print(f"Saved video to: {vid_path}")
         else:
             print("No images found for video.")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", "-i", default="input")
+    parser.add_argument("--output", "-o", default="output")
+    parser.add_argument("--subfolder", "-f", help="Subfolder name inside input directory")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--ext", default="jpg")
+    parser.add_argument("--workers", "-w", type=int, default=max(1, cpu_count()-1))
+    parser.add_argument("--video", action="store_true")
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--force-analyze", action="store_true")
+    parser.add_argument("--force-refine", action="store_true")
+    parser.add_argument("--render-only", action="store_true")
+    parser.add_argument("--resize-width", type=int, help="Target video width (e.g. 1920)")
+    parser.add_argument("--all-places", action="store_true", help="Process all subfolders in input directory sequentially")
+    args = parser.parse_args()
+    
+    if args.all_places:
+        if not os.path.exists(args.input):
+            print(f"Input directory {args.input} does not exist.")
+            return
+            
+        # Identify all subdirectores in input as 'places'
+        places = sorted([d for d in os.listdir(args.input) if os.path.isdir(os.path.join(args.input, d))])
+        if not places:
+            print(f"No subfolders found in {args.input}")
+            return
+            
+        print(f"Found {len(places)} places to process: {places}")
+        
+        for place in places:
+            print(f"\n{'='*70}")
+            print(f" PROCESSING PLACE: {place}")
+            print(f"{'='*70}")
+            
+            place_input = os.path.join(args.input, place)
+            place_output = os.path.join(args.output, place)
+            log_prefix = f"{place}_"
+            
+            try:
+                run_stabilization_task(place_input, place_output, log_prefix, place, args)
+            except Exception as e:
+                print(f"ERROR processing {place}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    else:
+        # Path Resolution for Single Mode
+        if args.subfolder:
+            input_root = os.path.join(args.input, args.subfolder)
+            output_root = os.path.join(args.output, args.subfolder)
+            log_prefix = f"{args.subfolder}_"
+            place_name = args.subfolder
+        else:
+            input_root = args.input
+            output_root = args.output
+            log_prefix = ""
+            place_name = None
+            
+        run_stabilization_task(input_root, output_root, log_prefix, place_name, args)
 
 if __name__ == "__main__":
     main()
