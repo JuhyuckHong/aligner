@@ -54,7 +54,7 @@ jobs:
         powershell Compress-Archive -Path dist/TimelapseAligner -DestinationPath dist/TimelapseAligner-Windows.zip
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.ARTIFACT_NAME }}
         path: |
