@@ -44,12 +44,48 @@ class ManualAlignVisualizer:
         # Window names
         self.win_main = "Manual Alignment (Drag to Move, Q to Save, ESC to Cancel)"
         self.win_zoom = "Fine Tune (x4)"
+        self.overlay_alpha = 0.45
         
     def get_display_img(self, img_full):
         """Resize full image to display size"""
         if self.display_scale == 1.0:
             return img_full
         return cv2.resize(img_full, None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_AREA)
+
+    def draw_move_overlay(self, img):
+        """Draw semi-transparent key guide for movement."""
+        lines = [
+            "MOVE KEYS",
+            "Mouse Drag: 이동",
+            "WASD : 1px (상/좌/하/우)",
+            "IJKL : 10px (상/좌/하/우)",
+            "8426 : 0.1px (상/좌/하/우)",
+            "7193 : 0.01px (좌상/좌하/우상/우하)",
+        ]
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        pad = 8
+        line_gap = 6
+
+        sizes = [cv2.getTextSize(t, font, font_scale, thickness)[0] for t in lines]
+        max_w = max(w for w, _ in sizes) if sizes else 0
+        line_h = max(h for _, h in sizes) if sizes else 0
+
+        x0, y0 = 10, 55
+        rect_w = max_w + pad * 2
+        rect_h = (line_h + line_gap) * len(lines) - line_gap + pad * 2
+
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + rect_w, y0 + rect_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, self.overlay_alpha, img, 1 - self.overlay_alpha, 0, img)
+
+        y = y0 + pad + line_h
+        for i, text in enumerate(lines):
+            color = (255, 255, 255) if i == 0 else (200, 220, 255)
+            cv2.putText(img, text, (x0 + pad, y), font, font_scale, color, thickness, cv2.LINE_AA)
+            y += line_h + line_gap
 
     def run(self):
         cv2.namedWindow(self.win_main)
@@ -96,6 +132,7 @@ class ManualAlignVisualizer:
             info = f"[{mode_text}] dx={self.dx:.2f} dy={self.dy:.2f}"
             cv2.putText(display_view, info, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            self.draw_move_overlay(display_view)
             
             # Draw Crosshair at mouse
             view_mouse_x = int(self.mouse_x * self.display_scale)
@@ -135,6 +172,10 @@ class ManualAlignVisualizer:
             elif key == ord('2'): self.dy += 0.1
             elif key == ord('4'): self.dx -= 0.1
             elif key == ord('6'): self.dx += 0.1
+            elif key == ord('7'): self.dy -= 0.01
+            elif key == ord('1'): self.dy += 0.01
+            elif key == ord('3'): self.dx -= 0.01
+            elif key == ord('9'): self.dx += 0.01
             
             elif key == ord(' '):
                 self.show_ref = not self.show_ref

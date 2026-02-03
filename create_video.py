@@ -105,9 +105,13 @@ def concat_videos(video_list, output_file):
         return False
     return True
 
-def create_video_chunked(input_dir, output_file, fps=30, crf=18, batch_size=200, ext='jpg', width=None):
+def create_video_chunked(input_dir, output_file, fps=30, crf=18, batch_size=200, ext='jpg', width=None, image_list=None):
     """Create video by processing images in chunks to avoid memory issues"""
-    images = get_images(input_dir, ext)
+    if image_list:
+        images = image_list
+    else:
+        images = get_images(input_dir, ext)
+        
     if not images:
         print("No images found!")
         return

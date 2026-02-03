@@ -42,9 +42,18 @@ DAMPING_FACTOR = 1.0
 DARK_THRESHOLD = 60.0   # Images with mean brightness below this are ignored
 TARGET_BRIGHTNESS = 110.0 # Target mean brightness for normalization
 
+# Default Options
+DEFAULT_OPTIONS = {
+    "dark_threshold": DARK_THRESHOLD,
+    "remove_dark": True,
+    "normalize_brightness": True,
+    "target_brightness": TARGET_BRIGHTNESS,
+    "verbose_errors": False,
+}
+
 # Refinement Precision
-DAY_REFINE_SAMPLES = 7 
-ECC_ITERATIONS = 500  # Increased for better convergence
+DAY_REFINE_SAMPLES = 5 
+ECC_ITERATIONS = 100  # Optimized for speed
 ECC_EPS = 1e-4
 
 # PID Control Parameters (Aggressive tuning for zero drift)
@@ -69,6 +78,14 @@ class PIDController:
         
         self.prev_error = error
         return current + output # Return new position
+
+def resolve_options(options=None):
+    resolved = DEFAULT_OPTIONS.copy()
+    if options:
+        for k, v in options.items():
+            if v is not None:
+                resolved[k] = v
+    return resolved
 
 def get_images(input_dir, ext='jpg'):
     patterns = [f"*.{ext}", f"*.{ext.upper()}"]
@@ -191,6 +208,165 @@ def apply_brightness_scale(img, scale):
     return cv2.cvtColor(hsv_norm, cv2.COLOR_HSV2BGR)
 
 
+
+# ---------------------------------------------------------------------------
+# UTILS: Brightness Calculation
+# ---------------------------------------------------------------------------
+def calculate_brightness_scales_for_folder(frames, options):
+    """
+    Calculates brightness scaling factors for a list of frames (from one folder)
+    using temporal smoothing.
+    Returns: dict {filename: scale}
+    """
+    options = resolve_options(options)
+    target_b = options.get('target_brightness', TARGET_BRIGHTNESS)
+    filtered_frames = [f for f in frames if f.get('status') != "DARK"]
+    
+    scales_map = {}
+    
+    if not filtered_frames:
+        return scales_map
+        
+    if not options.get('normalize_brightness', True):
+        for f in filtered_frames:
+            scales_map[f['filename']] = 1.0
+        return scales_map
+
+    # Extract raw brightness
+    raw_b = [f.get('brightness', target_b) for f in filtered_frames]
+    
+    # Smooth
+    def smooth_array_local(arr, window_size=15):
+        if len(arr) < window_size:
+            return arr
+        box = np.ones(window_size)/window_size
+        return np.convolve(arr, box, mode='same')
+
+    smoothed_b = smooth_array_local(raw_b, window_size=15)
+    
+    for i, f in enumerate(filtered_frames):
+        rb = raw_b[i]
+        
+        # Calculate Scale: Target / Raw (Clamped)
+        # We assume we want to reach Target Brightness.
+        
+        # To avoid noise amplification in very dark images:
+        denominator = max(rb, 10.0) 
+        scale = target_b / denominator
+        
+        # Clamp scale (e.g. 0.5x to 3.0x)
+        scale = np.clip(scale, 0.5, 3.0)
+        
+        scales_map[f['filename']] = float(scale)
+        
+    return scales_map
+
+def normalize_images_worker(args):
+    """
+    Worker to apply brightness normalization and save to new folder.
+    args: (folder_name, image_list, analysis_results, output_root, options, progress_queue)
+    """
+    folder_name, image_list, analysis_results, output_root, options, q = args
+    options = resolve_options(options)
+    
+    # Calculate scales
+    scales_map = calculate_brightness_scales_for_folder(analysis_results, options)
+    
+    # Output Dir (step1_normalized)
+    step1_5_dir = os.path.join(output_root, "step1_normalized", os.path.basename(folder_name))
+    if not os.path.exists(step1_5_dir):
+        os.makedirs(step1_5_dir)
+        
+    cnt = 0
+    for img_path in image_list:
+        fname = os.path.basename(img_path)
+        
+        # Skip dark/excluded images if they are not in map
+        if fname not in scales_map:
+            continue
+            
+        scale = scales_map[fname]
+        
+        # Read
+        img = cv2.imread(img_path)
+        if img is None: continue
+        
+        # Process (apply_brightness_scale helper or manual?)
+        # Use existing helper if available or inline
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        
+        v_new = cv2.multiply(v.astype(float), scale)
+        v_new = np.clip(v_new, 0, 255).astype(np.uint8)
+        
+        hsv_new = cv2.merge([h, s, v_new])
+        img_new = cv2.cvtColor(hsv_new, cv2.COLOR_HSV2BGR)
+        
+        # Save
+        out_path = os.path.join(step1_5_dir, fname)
+        cv2.imwrite(out_path, img_new)
+        
+        cnt += 1
+        if q and cnt % 5 == 0:
+             import multiprocessing
+             current_proc = multiprocessing.current_process().name
+             msg = f"Norm {cnt}/{len(image_list)}"
+             q.put(('WORKER_PROGRESS', current_proc, cnt/len(image_list)*100, msg))
+             # Legacy
+             q.put(('P_INC', 5))
+             
+    return cnt
+
+
+# ---------------------------------------------------------------------------
+# PHASE 0: Pre-processing (Worker)
+# ---------------------------------------------------------------------------
+def scan_dark_images_worker(args):
+    """
+    Scans a list of images and returns analysis for ALL files.
+    args: (folder_name, image_list, dark_threshold, progress_queue)
+    Returns: list of (img_path, brightness, is_dark)
+    """
+    folder_name, image_list, threshold, progress_queue = args[:4]
+    verbose_errors = args[4] if len(args) > 4 else False
+    results = [] # (path, brightness, is_dark)
+    error_count = 0
+    
+    import multiprocessing
+    current_proc = multiprocessing.current_process().name
+    
+    total = len(image_list)
+    for i, img_path in enumerate(image_list):
+        if progress_queue:
+            if i % 10 == 0:
+                # Progress Update: (WORKER_PROGRESS, proc_name, current/total, msg)
+                msg = f"Scanning {i}/{total}"
+                progress_queue.put(('WORKER_PROGRESS', current_proc, i/total*100, msg))
+            if i % 20 == 0:
+                progress_queue.put(('P_INC', 20)) # Keep global progress roughly
+
+        # Fast check
+        try:
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+            
+            b_val, is_dark = is_image_dark(img, threshold)
+            results.append((img_path, float(b_val), is_dark))
+        except Exception as e:
+            error_count += 1
+            if verbose_errors and error_count <= 3:
+                print(f"[Scan][{folder_name}] Error reading {os.path.basename(img_path)}: {e}")
+            continue
+            
+    if progress_queue:
+        progress_queue.put(('WORKER_PROGRESS', current_proc, 100, "Done"))
+    if error_count and verbose_errors:
+        print(f"[Scan][{folder_name}] Completed with {error_count} errors.")
+        
+    return results
+
+
 # ---------------------------------------------------------------------------
 # PHASE 1: Analysis (Worker)
 # ---------------------------------------------------------------------------
@@ -203,9 +379,13 @@ def analyze_folder_worker(args):
     input_dir = args[0]
     second_arg = args[1]
     progress_queue = None
+    options = {}
     
     if len(args) >= 3:
         progress_queue = args[2]
+    if len(args) >= 4:
+        options = args[3]
+    options = resolve_options(options)
     
     if isinstance(second_arg, str):
         ext = second_arg
@@ -216,6 +396,10 @@ def analyze_folder_worker(args):
     if not images:
         return (os.path.basename(input_dir), [])
 
+    # Options
+    dark_thresh = options.get('dark_threshold', DARK_THRESHOLD)
+    remove_dark = options.get('remove_dark', True) # Default to True if not specified
+    
     results = []
     scale = 0.5
     
@@ -243,15 +427,23 @@ def analyze_folder_worker(args):
     # ECC Criteria from README (500 iterations)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 500, 1e-4)
     
-    for i in range(1, len(images)):
+    import multiprocessing
+    current_proc = multiprocessing.current_process().name
+    total_imgs = len(images)
+    
+    for i in range(1, total_imgs):
         curr_path = images[i]
         curr_fname = os.path.basename(curr_path)
         
         # Report Progress
         if progress_queue:
             progress_queue.put(('P_INC', 1))
-            if i % 10 == 0:
-                progress_queue.put(f"[Analyzing] {folder_name}: {i}/{len(images)}")
+            if i % 5 == 0:
+                # Granular Update
+                msg = f"{folder_name[:10]}.. {i}/{total_imgs}"
+                progress_queue.put(('WORKER_PROGRESS', current_proc, i/total_imgs*100, msg))
+                # Legacy global update
+                progress_queue.put(f"[Analyzing] {folder_name}: {i}/{total_imgs}")
             
         curr_img = cv2.imread(curr_path)
         if curr_img is None:
@@ -262,9 +454,19 @@ def analyze_folder_worker(args):
             continue
 
         # Check for Dark Image
-        b_val, is_dark = is_image_dark(curr_img)
+        b_val, is_dark = is_image_dark(curr_img, threshold=dark_thresh)
         
         if is_dark:
+            status = "DARK"
+            # Even if we don't remove it here (we might do it in Phase 3),
+            # we should mark it. The logic in Phase 3 handles "DARK" status.
+            # But the user might want to NOT remove it.
+            # If ensure 'remove_dark' is False, we treat it as normal?
+            # Actually, current logic:
+            # - Analysis just marks it as DARK or brightness.
+            # - Integration decides whether to skip.
+            # So here we just mark it.
+            
             results.append({
                 "filename": curr_fname, "abs_path": curr_path,
                 "dx": 0.0, "dy": 0.0, "rot": 0.0, "status": "DARK",
@@ -387,7 +589,11 @@ def measure_day_gap_worker(args):
     """
     Compare Anchor Day (Day 1) and Target Day (Day N) using Virtual Alignment.
     """
-    anchor_day, target_day, s1_list, s2_list = args
+    if len(args) < 4:
+        raise ValueError("measure_day_gap_worker expects at least 4 args")
+    anchor_day, target_day, s1_list, s2_list = args[:4]
+    q = args[4] if len(args) > 4 else None
+    print(f"[Gap] Analyzing {os.path.basename(anchor_day)} -> {os.path.basename(target_day)}")
     
     if not s1_list or not s2_list:
         return (target_day, (0.0, 0.0, 0.0))
@@ -398,11 +604,19 @@ def measure_day_gap_worker(args):
     gaps_x = []
     gaps_y = []
     gaps_rot = []
-    scale = 0.5
+    scale = 0.25
+    
+    import multiprocessing
+    current_proc = multiprocessing.current_process().name
+    
+    # Calculate total iterations roughly for progress bar
+    total_pairs = len(s1_list) * len(s2_list)
+    pair_count = 0
     
     for samp1 in s1_list:
         if not os.path.exists(samp1['abs_path']): continue
         img1_full = cv2.imread(samp1['abs_path'])
+        if img1_full is None: continue
         
         # Warp Anchor (Day 1) to its base
         img1_small = cv2.resize(img1_full, None, fx=scale, fy=scale)
@@ -415,8 +629,18 @@ def measure_day_gap_worker(args):
         gray1 = cv2.cvtColor(warped1, cv2.COLOR_BGR2GRAY)
         
         for samp2 in s2_list:
+            pair_count += 1
             if not os.path.exists(samp2['abs_path']): continue
             img2_full = cv2.imread(samp2['abs_path'])
+            if img2_full is None: continue
+            
+            # Progress Log
+            msg = f"Gap {pair_count}/{total_pairs}: {os.path.basename(samp1['abs_path'])} vs {os.path.basename(samp2['abs_path'])}"
+            print(f"  [Gap] {msg}") # Keep print for terminal debugging
+            
+            if q:
+                q.put(('WORKER_PROGRESS', current_proc, (pair_count/total_pairs)*100, msg))
+            
             img2_small = cv2.resize(img2_full, None, fx=scale, fy=scale)
             
             # Warp Target (Day N) to its base
@@ -460,12 +684,51 @@ def measure_day_gap_worker(args):
     else:
         final_gap_dx, final_gap_dy, final_gap_rot = 0.0, 0.0, 0.0
         
+    print(f"[Gap] Result {os.path.basename(target_day)}: ({final_gap_dx:.2f}, {final_gap_dy:.2f})")
     return (target_day, (final_gap_dx, final_gap_dy, final_gap_rot))
+
+# ---------------------------------------------------------------------------
+# Day Gap Helpers
+# ---------------------------------------------------------------------------
+def parse_day_gap_entry(entry):
+    """Return (dx, dy, rot) from tuple/list/dict day gap entries."""
+    dx = dy = rot = 0.0
+    if isinstance(entry, dict):
+        try:
+            dx = float(entry.get("dx", 0.0))
+        except Exception:
+            dx = 0.0
+        try:
+            dy = float(entry.get("dy", 0.0))
+        except Exception:
+            dy = 0.0
+        try:
+            rot = float(entry.get("rot", 0.0))
+        except Exception:
+            rot = 0.0
+    elif isinstance(entry, (list, tuple)):
+        if len(entry) > 0:
+            try:
+                dx = float(entry[0])
+            except Exception:
+                dx = 0.0
+        if len(entry) > 1:
+            try:
+                dy = float(entry[1])
+            except Exception:
+                dy = 0.0
+        if len(entry) > 2:
+            try:
+                rot = float(entry[2])
+            except Exception:
+                rot = 0.0
+    return dx, dy, rot
 
 # ---------------------------------------------------------------------------
 # PHASE 3: Integration
 # ---------------------------------------------------------------------------
-def integrate_trajectory(folder_analyses, day_gaps_dict):
+def integrate_trajectory(folder_analyses, day_gaps_dict, options={}):
+    options = resolve_options(options)
     sorted_folders = sorted(folder_analyses.keys())
     global_trajectory = {}
     
@@ -487,31 +750,44 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
     
     for i, folder in enumerate(sorted_folders):
         frames = folder_analyses[folder]
+        if not frames:
+            global_trajectory[folder] = []
+            continue
         
         # Transition from Previous Day
         if i > 0:
-            prev_folder = sorted_folders[i-1]
-            last_img = folder_analyses[prev_folder][-1]['abs_path']
-            first_img = frames[0]['abs_path']
-            
-            scale = 0.5
-            prev_grad = cv2.resize(create_gradient(cv2.imread(last_img)), None, fx=scale, fy=scale)
-            curr_grad = cv2.resize(create_gradient(cv2.imread(first_img)), None, fx=scale, fy=scale)
-            
-            trans_dx, trans_dy, _ = phase_correlation(prev_grad, curr_grad)
-            trans_dx /= scale
-            trans_dy /= scale
-            
-            current_global_dx += trans_dx
-            current_global_dy += trans_dy
-            print(f"  Transition {prev_folder}->{folder}: ({trans_dx:.1f}, {trans_dy:.1f})")
+            prev_idx = i - 1
+            while prev_idx >= 0 and not folder_analyses[sorted_folders[prev_idx]]:
+                prev_idx -= 1
+            if prev_idx >= 0:
+                prev_folder = sorted_folders[prev_idx]
+                prev_frames = folder_analyses[prev_folder]
+                last_img = prev_frames[-1]['abs_path']
+                first_img = frames[0]['abs_path']
+                
+                scale = 0.5
+                prev_img = cv2.imread(last_img)
+                curr_img = cv2.imread(first_img)
+                if prev_img is not None and curr_img is not None:
+                    prev_grad = cv2.resize(create_gradient(prev_img), None, fx=scale, fy=scale)
+                    curr_grad = cv2.resize(create_gradient(curr_img), None, fx=scale, fy=scale)
+                    
+                    trans_dx, trans_dy, _ = phase_correlation(prev_grad, curr_grad)
+                    trans_dx /= scale
+                    trans_dy /= scale
+                    
+                    current_global_dx += trans_dx
+                    current_global_dy += trans_dy
+                    print(f"  Transition {prev_folder}->{folder}: ({trans_dx:.1f}, {trans_dy:.1f})")
             
         start_dx = current_global_dx
         start_dy = current_global_dy
         start_rot = current_global_rot
         
         # Raw Target from Anchor Refinement
-        raw_target_dx, raw_target_dy, raw_target_rot = day_gaps_dict.get(folder, (0.0, 0.0, 0.0))
+        raw_target_dx, raw_target_dy, raw_target_rot = parse_day_gap_entry(
+            day_gaps_dict.get(folder, (0.0, 0.0, 0.0))
+        )
         
         # PID Update
         smoothed_target_dx = pid_dx.update(smoothed_target_dx, raw_target_dx)
@@ -538,7 +814,7 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
         
         for idx, frame in enumerate(frames):
             # FILTER DARK IMAGES HERE
-            if frame['status'] == "DARK":
+            if options.get('remove_dark', True) and frame['status'] == "DARK":
                 continue
                 
             local_acc_dx += frame['dx']
@@ -569,32 +845,18 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
             })
             
         # --- Temporal Brightness Smoothing ---
-        # 1. Extract valid brightness values
-        raw_brightness = []
-        valid_indices = []
-        for i, item in enumerate(folder_trajectory):
-            # Try to get brightness from original frame data
-            # We need to look up the original frame in 'frames' list to get 'brightness'
-            # But folder_trajectory indices map 1:1 to 'frames' minus skipped darks
-            # Actually, we removed darks, so we need to match carefully.
-            # Simplified: store 'brightness' in folder_trajectory during loop above
-            pass
-
-        # Re-loop to update brightness in trajectory
-        # Actually easier to do it in one go.
-        # Let's collect brightness from the filtered 'frames' used in trajectory
         filtered_frames = [f for f in frames if f['status'] != "DARK"]
         
-        if filtered_frames:
-            raw_b = [f.get('brightness', 110.0) for f in filtered_frames]
+        if filtered_frames and options.get('normalize_brightness', True):
+            target_b = options.get('target_brightness', 110.0)
+            raw_b = [f.get('brightness', target_b) for f in filtered_frames]
             
             # Smooth
             smoothed_b = smooth_array(raw_b, window_size=15)
             
-            # Calculate Scale
-            # scale = smoothed / raw
-            # raw can be 0 (theoretically), but threshold is 60, so safe.
-            for i, item in enumerate(folder_trajectory):
+            # Calculate Scale for non-dark frames
+            scale_map = {}
+            for i, f in enumerate(filtered_frames):
                 rb = raw_b[i]
                 sb = smoothed_b[i]
                 if rb > 1.0:
@@ -603,7 +865,15 @@ def integrate_trajectory(folder_analyses, day_gaps_dict):
                     scale = np.clip(scale, 0.8, 1.25) # Gentle correction
                 else:
                     scale = 1.0
-                item['brightness_scale'] = float(scale)
+                scale_map[f['filename']] = float(scale)
+            
+            # Apply scales (dark frames default to 1.0)
+            for item in folder_trajectory:
+                item['brightness_scale'] = scale_map.get(item['filename'], 1.0)
+        else:
+            # No normalization
+            for item in folder_trajectory:
+                item['brightness_scale'] = 1.0
                 
         global_trajectory[folder] = folder_trajectory
         
@@ -625,12 +895,19 @@ def render_folder_worker(args):
     progress_queue = None
     if len(args) >= 4:
         progress_queue = args[3]
+    
+    import multiprocessing
+    current_proc = multiprocessing.current_process().name
         
     os.makedirs(output_dir, exist_ok=True)
     
     for idx, item in enumerate(trajectory):
         if progress_queue:
             progress_queue.put(('P_INC', 1))
+            if idx % 10 == 0:
+                msg = f"Render {idx}/{len(trajectory)}"
+                pct = (idx / max(1, len(trajectory))) * 100
+                progress_queue.put(('WORKER_PROGRESS', current_proc, pct, msg))
 
         img = cv2.imread(item['abs_path'])
         if img is None: continue
@@ -838,7 +1115,13 @@ def run_stabilization_task(input_root, output_root, log_prefix, place_name, args
             video_images.extend(imgs)
             
         if video_images:
-            create_video.create_chunk_video(video_images, vid_path, fps=args.fps, width=args.resize_width)
+            create_video.create_video_chunked(
+                input_dir=output_root, 
+                output_file=vid_path, 
+                fps=args.fps, 
+                width=args.resize_width,
+                image_list=video_images
+            )
             print(f"Saved video to: {vid_path}")
         else:
             print("No images found for video.")
