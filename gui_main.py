@@ -1261,9 +1261,17 @@ class AlignerApp(LayoutMixin):
 
     def scan_output_step1(self):
         self.build_output_tree("step1")
+        try:
+            self.left_tabs.select(self.tab_step1)
+        except Exception:
+            pass
 
     def scan_output_step2(self):
         self.build_output_tree("step2")
+        try:
+            self.left_tabs.select(self.tab_step2)
+        except Exception:
+            pass
 
     def build_output_tree(self, step):
         output_dir = self.get_project_output_dir(create=False)
