@@ -48,6 +48,8 @@ class AlignerApp(LayoutMixin):
         self.current_step = None
         self.file_size_map = {}
         self.project_name_dirty = False
+        self.frame_item_map = {}            # {tree_item_id: (folder_path, frame_index)}
+        self.current_frame_selection = None  # (folder_path, frame_index) or None
         
         # Styling
         style = ttk.Style()
@@ -812,6 +814,7 @@ class AlignerApp(LayoutMixin):
             self.polling = False
             
             self.root.after(0, self.populate_tree)
+            self.root.after(0, self.refresh_frame_tree)
             self.root.after(0, lambda: self.left_tabs.select(self.tab_transitions))
             self.root.after(0, lambda: self.progress.configure(value=0))
             self.root.after(0, self.log, "2단계 분석 완료.")
@@ -1772,6 +1775,7 @@ class AlignerApp(LayoutMixin):
             # Finish
             self.polling = False
             self.root.after(0, self.populate_tree)
+            self.root.after(0, self.refresh_frame_tree)
             self.root.after(0, lambda: self.left_tabs.select(self.tab_transitions))
             self.root.after(0, lambda: self.btn_render.config(state="normal"))
             self.root.after(0, lambda: self.btn_analyze.config(state="normal"))
@@ -1783,6 +1787,164 @@ class AlignerApp(LayoutMixin):
             self.polling = False
             self.root.after(0, self.log, f"Error: {e}")
             self.root.after(0, lambda: self.btn_analyze.config(state="normal"))
+
+    # --- Per-Frame Analysis Tree ---
+
+    def refresh_frame_tree(self):
+        self.tree_frames.delete(*self.tree_frames.get_children())
+        self.frame_item_map.clear()
+        self.current_frame_selection = None
+        self.btn_frame_align.config(state="disabled")
+
+        self.tree_frames.tag_configure("frame_normal", foreground=TEXT_PRIMARY)
+        self.tree_frames.tag_configure("frame_jump", foreground=STATUS_WARNING)
+        self.tree_frames.tag_configure("frame_big_jump", foreground=STATUS_ERROR)
+        self.tree_frames.tag_configure("frame_manual", foreground=ACCENT_PRIMARY)
+        self.tree_frames.tag_configure("frame_dark", foreground=TEXT_MUTED)
+
+        JUMP_THRESHOLD = 5.0
+        BIG_JUMP_THRESHOLD = 15.0
+
+        for folder in self.sorted_folders:
+            frames = self.folder_analyses.get(folder, [])
+            if not frames:
+                continue
+
+            max_jump = 0.0
+            for f in frames:
+                mag = (f['dx']**2 + f['dy']**2)**0.5
+                max_jump = max(max_jump, mag)
+
+            folder_name = os.path.basename(folder)
+            folder_node = self.tree_frames.insert(
+                "", "end", text=folder_name,
+                values=(f"{len(frames)}", "", "", "", f"Max:{max_jump:.1f}", ""))
+
+            acc_dx = 0.0
+            acc_dy = 0.0
+            for idx, frame in enumerate(frames):
+                acc_dx += frame['dx']
+                acc_dy += frame['dy']
+
+                mag = (frame['dx']**2 + frame['dy']**2)**0.5
+                status = frame.get('status', 'OK')
+
+                if status == "DARK":
+                    tag = "frame_dark"
+                elif str(status).lower() == "manual":
+                    tag = "frame_manual"
+                elif mag >= BIG_JUMP_THRESHOLD:
+                    tag = "frame_big_jump"
+                elif mag >= JUMP_THRESHOLD:
+                    tag = "frame_jump"
+                else:
+                    tag = "frame_normal"
+
+                item_id = self.tree_frames.insert(
+                    folder_node, "end",
+                    text=frame['filename'],
+                    values=(
+                        f"{frame['dx']:.2f}",
+                        f"{frame['dy']:.2f}",
+                        f"{frame['rot']:.3f}",
+                        status,
+                        f"{acc_dx:.1f}",
+                        f"{acc_dy:.1f}"
+                    ),
+                    tags=(tag,))
+
+                self.frame_item_map[item_id] = (folder, idx)
+
+    def on_frame_select(self, event):
+        self.disable_compare_controls()
+        sel = self.tree_frames.selection()
+        if not sel:
+            self.btn_frame_align.config(state="disabled")
+            return
+
+        item_id = sel[0]
+        if item_id not in self.frame_item_map:
+            self.btn_frame_align.config(state="disabled")
+            return
+
+        folder_path, frame_idx = self.frame_item_map[item_id]
+        frames = self.folder_analyses[folder_path]
+        frame = frames[frame_idx]
+        self.current_frame_selection = (folder_path, frame_idx)
+
+        if frame_idx == 0:
+            self.show_preview_image(frame['abs_path'])
+            self.lbl_preview_title.config(
+                text=f"프레임: {frame['filename']} (기준 프레임)")
+            self.btn_frame_align.config(state="disabled")
+        else:
+            prev_frame = frames[frame_idx - 1]
+            self._show_frame_align_preview(prev_frame, frame)
+            is_adjustable = frame.get('status') not in ("DARK", "FAIL_READ")
+            self.btn_frame_align.config(
+                state="normal" if is_adjustable else "disabled")
+
+    def _show_frame_align_preview(self, prev_frame, curr_frame):
+        img_ref = cv2.imread(prev_frame['abs_path'])
+        img_cur = cv2.imread(curr_frame['abs_path'])
+        if img_ref is None or img_cur is None:
+            return
+
+        h, w = img_ref.shape[:2]
+        dx, dy = curr_frame['dx'], curr_frame['dy']
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        aligned = cv2.warpAffine(img_cur, M, (w, h))
+
+        if aligned.shape[:2] != img_ref.shape[:2]:
+            aligned = cv2.resize(aligned, (w, h))
+
+        blended = cv2.addWeighted(img_ref, 0.5, aligned, 0.5, 0)
+        blended = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+
+        status = curr_frame.get('status', 'OK')
+        title = (f"프레임: {curr_frame['filename']} | "
+                 f"dx={dx:.2f} dy={dy:.2f} rot={curr_frame['rot']:.3f} | {status}")
+        self.lbl_preview_title.config(text=title)
+        self.render_preview_image(blended)
+
+    def on_frame_double_click(self, event):
+        sel = self.tree_frames.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        if item_id in self.frame_item_map:
+            self.open_frame_visualizer()
+
+    def open_frame_visualizer(self):
+        if not self.current_frame_selection:
+            return
+
+        folder_path, frame_idx = self.current_frame_selection
+        frames = self.folder_analyses[folder_path]
+
+        if frame_idx == 0:
+            messagebox.showinfo("알림", "첫 번째 프레임은 기준 프레임이므로 조정할 수 없습니다.")
+            return
+
+        current_frame = frames[frame_idx]
+        prev_frame = frames[frame_idx - 1]
+
+        vis = ManualAlignVisualizer(
+            prev_frame['abs_path'],
+            current_frame['abs_path'],
+            initial_dx=current_frame['dx'],
+            initial_dy=current_frame['dy']
+        )
+        result = vis.run()
+
+        if result is not None:
+            new_dx, new_dy = result
+            current_frame['dx'] = new_dx
+            current_frame['dy'] = new_dy
+            current_frame['status'] = "Manual"
+
+            self.save_step1_results()
+            self.refresh_frame_tree()
 
     def populate_tree(self):
         self.tree_trans.delete(*self.tree_trans.get_children())

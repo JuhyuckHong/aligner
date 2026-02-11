@@ -423,6 +423,38 @@ class LayoutMixin:
 
         self.tree_step1_input.bind("<<TreeviewSelect>>", self.on_step1_input_select)
 
+        # Tab 2.5: Frame Analysis (Per-frame dx/dy/rot)
+        self.tab_frames = tk.Frame(self.left_tabs, bg=BG_DARK)
+        self.left_tabs.add(self.tab_frames, text="  프레임 분석  ")
+
+        frame_columns = ("dx", "dy", "rot", "status", "acc_dx", "acc_dy")
+        self.tree_frames = ttk.Treeview(
+            self.tab_frames, columns=frame_columns, show="tree headings",
+            selectmode="browse")
+        self.tree_frames.heading("#0", text="폴더 / 파일명")
+        self.tree_frames.heading("dx", text="dx")
+        self.tree_frames.heading("dy", text="dy")
+        self.tree_frames.heading("rot", text="rot")
+        self.tree_frames.heading("status", text="상태")
+        self.tree_frames.heading("acc_dx", text="누적dx")
+        self.tree_frames.heading("acc_dy", text="누적dy")
+        self.tree_frames.column("#0", width=160)
+        self.tree_frames.column("dx", width=55, anchor="e")
+        self.tree_frames.column("dy", width=55, anchor="e")
+        self.tree_frames.column("rot", width=50, anchor="e")
+        self.tree_frames.column("status", width=50, anchor="center")
+        self.tree_frames.column("acc_dx", width=55, anchor="e")
+        self.tree_frames.column("acc_dy", width=55, anchor="e")
+
+        sf_frames = ttk.Scrollbar(self.tab_frames, orient="vertical",
+                                   command=self.tree_frames.yview)
+        self.tree_frames.configure(yscrollcommand=sf_frames.set)
+        self.tree_frames.pack(side="left", fill="both", expand=True)
+        sf_frames.pack(side="right", fill="y")
+
+        self.tree_frames.bind("<<TreeviewSelect>>", self.on_frame_select)
+        self.tree_frames.bind("<Double-1>", self.on_frame_double_click)
+
         # Tab 3: Step2 Results (Transitions)
         self.tab_transitions = tk.Frame(self.left_tabs, bg=BG_DARK)
         self.left_tabs.add(self.tab_transitions, text="  Step2 결과  ")
@@ -533,6 +565,11 @@ class LayoutMixin:
         self.btn_compare_toggle = ttk.Button(
             inner_tb, text="A/B", command=self.toggle_compare_view, state="disabled")
         self.btn_compare_toggle.pack(side="left", padx=(PAD_SM, 0))
+
+        self.btn_frame_align = ttk.Button(
+            inner_tb, text="프레임 정렬",
+            style="Accent.TButton", command=self.open_frame_visualizer, state="disabled")
+        self.btn_frame_align.pack(side="right", padx=(PAD_SM, 0))
 
         self.btn_edit_align = ttk.Button(
             inner_tb, text="수동 정렬",

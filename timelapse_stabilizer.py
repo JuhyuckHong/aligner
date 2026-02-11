@@ -915,8 +915,9 @@ def render_folder_worker(args):
         h, w = img.shape[:2]
         center = (w // 2, h // 2)
         
-        dx = item['final_dx']
-        dy = item['final_dy']
+        # analysis dx/dy represents motion of current frame; invert to apply correction
+        dx = -item['final_dx']
+        dy = -item['final_dy']
         rot = item['rot']
         
         M = cv2.getRotationMatrix2D(center, rot, 1.0) 
