@@ -3,11 +3,15 @@ gui_visualizer.py - Enhanced Manual Alignment Visualizer with Mouse Support
 """
 import cv2
 import numpy as np
+import os
 
 class ManualAlignVisualizer:
-    def __init__(self, ref_img_path, mov_img_path, initial_dx=0.0, initial_dy=0.0):
+    def __init__(self, ref_img_path, mov_img_path, initial_dx=0.0, initial_dy=0.0,
+                 ref_label=None, mov_label=None):
         self.ref_path = ref_img_path
         self.mov_path = mov_img_path
+        self.ref_label = ref_label or os.path.basename(ref_img_path)
+        self.mov_label = mov_label or os.path.basename(mov_img_path)
         
         # Load images
         self.ref_img_full = cv2.imread(ref_img_path)
@@ -55,21 +59,21 @@ class ManualAlignVisualizer:
     def draw_move_overlay(self, img):
         """Draw semi-transparent key guide for movement."""
         lines = [
-            "MOVE KEYS",
-            "Mouse Drag: 이동",
-            "WASD : 1px (상/좌/하/우)",
-            "IJKL : 10px (상/좌/하/우)",
-            "8426 : 0.1px (상/좌/하/우)",
-            "7193 : 0.01px (좌상/좌하/우상/우하)",
+            ("MOVE KEYS", True),
+            ("^  i 10px  w 1px  8 0.1px  7 0.01px", False),
+            ("v  k 10px  s 1px  2 0.1px  1 0.01px", False),
+            ("<  j 10px  a 1px  4 0.1px  3 0.01px", False),
+            (">  l 10px  d 1px  6 0.1px  9 0.01px", False),
+            ("Drag: move  R: reset", False),
         ]
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
+        font_scale = 0.45
         thickness = 1
         pad = 8
-        line_gap = 6
+        line_gap = 5
 
-        sizes = [cv2.getTextSize(t, font, font_scale, thickness)[0] for t in lines]
+        sizes = [cv2.getTextSize(t, font, font_scale, thickness)[0] for t, _ in lines]
         max_w = max(w for w, _ in sizes) if sizes else 0
         line_h = max(h for _, h in sizes) if sizes else 0
 
@@ -82,8 +86,8 @@ class ManualAlignVisualizer:
         cv2.addWeighted(overlay, self.overlay_alpha, img, 1 - self.overlay_alpha, 0, img)
 
         y = y0 + pad + line_h
-        for i, text in enumerate(lines):
-            color = (255, 255, 255) if i == 0 else (200, 220, 255)
+        for text, is_header in lines:
+            color = (255, 255, 255) if is_header else (200, 220, 255)
             cv2.putText(img, text, (x0 + pad, y), font, font_scale, color, thickness, cv2.LINE_AA)
             y += line_h + line_gap
 
@@ -118,20 +122,26 @@ class ManualAlignVisualizer:
             # 2. Prepare Display
             if self.overlay_mode:
                 display_full = cv2.addWeighted(self.ref_img_full, 0.5, aligned_full, 0.5, 0)
-                mode_text = "OVERLAY"
+                mode_tag = "OVERLAY"
+                file_tag = ""
             elif self.show_ref:
                 display_full = self.ref_img_full.copy()
-                mode_text = "REFERENCE"
+                mode_tag = "REF    "
+                file_tag = self.ref_label
             else:
                 display_full = aligned_full.copy()
-                mode_text = "ALIGNED"
-                
+                mode_tag = "ALIGNED"
+                file_tag = self.mov_label
+
             display_view = self.get_display_img(display_full)
-            
-            # Draw UI
-            info = f"[{mode_text}] dx={self.dx:.2f} dy={self.dy:.2f}"
-            cv2.putText(display_view, info, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # Draw UI — mode + dx/dy on line 1, filename on line 2
+            line1 = f"[{mode_tag}] dx={self.dx:.2f} dy={self.dy:.2f}"
+            cv2.putText(display_view, line1, (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if file_tag:
+                cv2.putText(display_view, file_tag, (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 180), 1, cv2.LINE_AA)
             self.draw_move_overlay(display_view)
             
             # Draw Crosshair at mouse

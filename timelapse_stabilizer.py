@@ -931,7 +931,9 @@ def render_folder_worker(args):
         b_scale = item.get('brightness_scale', 1.0)
         aligned = apply_brightness_scale(aligned, b_scale)
         
-        cv2.imwrite(os.path.join(output_dir, item['filename']), aligned, [cv2.IMWRITE_JPEG_QUALITY, 98])
+        day_name = os.path.basename(output_dir)
+        out_name = f"{day_name} {idx+1:04d}.jpg"
+        cv2.imwrite(os.path.join(output_dir, out_name), aligned, [cv2.IMWRITE_JPEG_QUALITY, 98])
         
         if idx % 50 == 0:
             if progress_queue:

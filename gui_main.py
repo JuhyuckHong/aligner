@@ -1794,7 +1794,6 @@ class AlignerApp(LayoutMixin):
         self.tree_frames.delete(*self.tree_frames.get_children())
         self.frame_item_map.clear()
         self.current_frame_selection = None
-        self.btn_frame_align.config(state="disabled")
 
         self.tree_frames.tag_configure("frame_normal", foreground=TEXT_PRIMARY)
         self.tree_frames.tag_configure("frame_jump", foreground=STATUS_WARNING)
@@ -1857,14 +1856,17 @@ class AlignerApp(LayoutMixin):
 
     def on_frame_select(self, event):
         self.disable_compare_controls()
+        self.current_transition_idx = -1
         sel = self.tree_frames.selection()
         if not sel:
-            self.btn_frame_align.config(state="disabled")
+            self.btn_edit_align.config(state="disabled")
+            self.current_frame_selection = None
             return
 
         item_id = sel[0]
         if item_id not in self.frame_item_map:
-            self.btn_frame_align.config(state="disabled")
+            self.btn_edit_align.config(state="disabled")
+            self.current_frame_selection = None
             return
 
         folder_path, frame_idx = self.frame_item_map[item_id]
@@ -1876,12 +1878,12 @@ class AlignerApp(LayoutMixin):
             self.show_preview_image(frame['abs_path'])
             self.lbl_preview_title.config(
                 text=f"프레임: {frame['filename']} (기준 프레임)")
-            self.btn_frame_align.config(state="disabled")
+            self.btn_edit_align.config(state="disabled")
         else:
             prev_frame = frames[frame_idx - 1]
             self._show_frame_align_preview(prev_frame, frame)
             is_adjustable = frame.get('status') not in ("DARK", "FAIL_READ")
-            self.btn_frame_align.config(
+            self.btn_edit_align.config(
                 state="normal" if is_adjustable else "disabled")
 
     def _show_frame_align_preview(self, prev_frame, curr_frame):
@@ -1913,7 +1915,14 @@ class AlignerApp(LayoutMixin):
             return
         item_id = sel[0]
         if item_id in self.frame_item_map:
+            self.open_manual_align()
+
+    def open_manual_align(self):
+        """Unified manual alignment — dispatches to frame or day-to-day."""
+        if self.current_frame_selection:
             self.open_frame_visualizer()
+        elif self.current_transition_idx >= 0:
+            self.open_visualizer()
 
     def open_frame_visualizer(self):
         if not self.current_frame_selection:
@@ -1979,6 +1988,7 @@ class AlignerApp(LayoutMixin):
 
     def on_select_transition(self, event):
         self.disable_compare_controls()
+        self.current_frame_selection = None
         # When selecting transition, switch preview to alignment mode
         sel = self.tree_trans.selection()
         if not sel: return

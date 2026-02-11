@@ -566,14 +566,9 @@ class LayoutMixin:
             inner_tb, text="A/B", command=self.toggle_compare_view, state="disabled")
         self.btn_compare_toggle.pack(side="left", padx=(PAD_SM, 0))
 
-        self.btn_frame_align = ttk.Button(
-            inner_tb, text="프레임 정렬",
-            style="Accent.TButton", command=self.open_frame_visualizer, state="disabled")
-        self.btn_frame_align.pack(side="right", padx=(PAD_SM, 0))
-
         self.btn_edit_align = ttk.Button(
             inner_tb, text="수동 정렬",
-            style="Accent.TButton", command=self.open_visualizer, state="disabled")
+            style="Accent.TButton", command=self.open_manual_align, state="disabled")
         self.btn_edit_align.pack(side="right", padx=(PAD_SM, 0))
 
         self.btn_exclude = ttk.Button(
